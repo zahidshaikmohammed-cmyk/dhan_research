@@ -1,0 +1,103 @@
+name: UNPSYCHIC29 Gate 1 Empirical Research
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  gate1:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download complete export
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG=chatgpt-full-data-33258430945
+          BASE=https://github.com/zahidshaikmohammed-cmyk/dhan_research/releases/download/$TAG
+          mkdir -p input data output
+          curl -fL --retry 5 --retry-delay 2 -o input/001.zip $BASE/chatgpt-data-001.zip
+          curl -fL --retry 5 --retry-delay 2 -o input/002.zip $BASE/chatgpt-data-002.zip
+          unzip -q input/001.zip -d data
+          unzip -q input/002.zip -d data
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check -q pandas duckdb numpy
+      - name: Compute Gate 1 from all sessions
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import duckdb, pandas as pd, numpy as np, json
+          root=Path('data'); out=Path('output'); out.mkdir(exist_ok=True)
+          files=list(root.rglob('daily_features_500*.csv'))
+          if not files:
+              files=[p for p in root.rglob('*.csv') if p.name.startswith('daily_features_500')]
+          assert files, 'daily_features_500 CSV not found'
+          con=duckdb.connect()
+          paths=','.join("'"+str(p).replace("'","''")+"'" for p in files)
+          q=f"SELECT * FROM read_csv_auto([{paths}], union_by_name=true, header=true)"
+          con.execute('CREATE OR REPLACE VIEW d AS '+q)
+          cols=[r[0] for r in con.execute('DESCRIBE d').fetchall()]
+          required=['symbol','trade_date','previous_close','open','gap_pct']
+          assert all(c in cols for c in required), (cols,required)
+          # Recompute gap from prices; stored gap is used only as a consistency check.
+          con.execute("CREATE OR REPLACE VIEW x AS SELECT *, CASE WHEN previous_close IS NULL OR previous_close=0 OR open IS NULL THEN NULL ELSE (open/previous_close-1.0)*100.0 END AS gap_recalc_pct FROM d")
+          con.execute("CREATE OR REPLACE VIEW v AS SELECT * FROM x WHERE previous_close IS NOT NULL AND previous_close>0 AND open IS NOT NULL")
+          # Exact all-session stock-level empirical distribution.
+          sql='''SELECT symbol, COUNT(*) valid_sessions,
+            MEDIAN(ABS(gap_recalc_pct))/100.0 median_abs_gap,
+            quantile_cont(ABS(gap_recalc_pct)/100.0,0.75) p75_abs_gap,
+            quantile_cont(ABS(gap_recalc_pct)/100.0,0.90) p90_abs_gap,
+            quantile_cont(ABS(gap_recalc_pct)/100.0,0.95) p95_abs_gap,
+            quantile_cont(ABS(gap_recalc_pct)/100.0,0.99) p99_abs_gap,
+            MAX(ABS(gap_recalc_pct))/100.0 max_abs_gap,
+            AVG(CASE WHEN gap_recalc_pct>=0.50 THEN 1 ELSE 0 END) gap_up_050_rate,
+            AVG(CASE WHEN gap_recalc_pct<=-0.50 THEN 1 ELSE 0 END) gap_down_050_rate,
+            AVG(CASE WHEN gap_recalc_pct>=0.75 THEN 1 ELSE 0 END) gap_up_075_rate,
+            AVG(CASE WHEN gap_recalc_pct<=-0.75 THEN 1 ELSE 0 END) gap_down_075_rate,
+            AVG(CASE WHEN gap_recalc_pct>=1.00 THEN 1 ELSE 0 END) gap_up_100_rate,
+            AVG(CASE WHEN gap_recalc_pct<=-1.00 THEN 1 ELSE 0 END) gap_down_100_rate,
+            AVG(CASE WHEN ABS(gap_recalc_pct)>=1.00 THEN 1 ELSE 0 END) large_gap_100_rate,
+            AVG(CASE WHEN ABS(gap_recalc_pct)>=1.50 THEN 1 ELSE 0 END) large_gap_150_rate,
+            AVG(CASE WHEN ABS(gap_recalc_pct)>=2.00 THEN 1 ELSE 0 END) large_gap_200_rate,
+            AVG(gap_recalc_pct)/100.0 mean_signed_gap,
+            MEDIAN(gap_recalc_pct)/100.0 median_signed_gap,
+            AVG(CASE WHEN gap_recalc_pct>0 THEN 1 ELSE 0 END) gap_up_rate
+          FROM v GROUP BY symbol'''
+          df=con.execute(sql).df()
+          # Data integrity checks specific to Gate 1.
+          checks={
+            'input_rows':int(con.execute('SELECT COUNT(*) FROM d').fetchone()[0]),
+            'valid_gap_rows':int(con.execute('SELECT COUNT(*) FROM v').fetchone()[0]),
+            'symbols':int(con.execute('SELECT COUNT(DISTINCT symbol) FROM v').fetchone()[0]),
+            'date_min':str(con.execute('SELECT MIN(trade_date) FROM v').fetchone()[0]),
+            'date_max':str(con.execute('SELECT MAX(trade_date) FROM v').fetchone()[0]),
+            'stored_gap_abs_max_difference_pct_points':float(con.execute('SELECT MAX(ABS(gap_pct-gap_recalc_pct)) FROM v WHERE gap_pct IS NOT NULL').fetchone()[0] or 0),
+            'null_gap_pct':int(con.execute('SELECT COUNT(*) FROM d WHERE gap_pct IS NULL').fetchone()[0]),
+            'duplicate_symbol_date_rows':int(con.execute('SELECT COUNT(*)-COUNT(DISTINCT hash(symbol,trade_date)) FROM d').fetchone()[0]),
+          }
+          # Never choose an arbitrary count. Produce several candidate boundaries for scientific inspection.
+          df['combined_large_gap_rate']=df['large_gap_100_rate']
+          df['gate1_score']=(1-df['large_gap_100_rate'])*(1-df['large_gap_150_rate'])*(1-df['large_gap_200_rate'])
+          df=df.sort_values(['large_gap_100_rate','p95_abs_gap','p99_abs_gap','median_abs_gap','max_abs_gap','symbol']).reset_index(drop=True)
+          df.insert(0,'gate1_rank',np.arange(1,len(df)+1))
+          df.to_csv(out/'UNPSYCHIC29_GATE1_ALL_500.csv',index=False)
+          # Population distribution and candidate structural cut points.
+          cut_rows=[]
+          for c in ['large_gap_100_rate','large_gap_150_rate','large_gap_200_rate','p95_abs_gap','p99_abs_gap','median_abs_gap']:
+              s=df[c]
+              for q in [0.50,0.60,0.70,0.75,0.80,0.85,0.90,0.95]: cut_rows.append({'metric':c,'quantile':q,'value':float(s.quantile(q))})
+          pd.DataFrame(cut_rows).to_csv(out/'GATE1_population_quantiles.csv',index=False)
+          Path(out/'GATE1_integrity.json').write_text(json.dumps(checks,indent=2))
+          # Top/bottom and rank neighborhoods for scientific review.
+          pd.concat([df.head(75),df.tail(75)]).to_csv(out/'GATE1_extremes_and_boundary.csv',index=False)
+          print(json.dumps(checks,indent=2)); print(df.head(40).to_string(index=False))
+          PY
+      - name: Upload Gate 1 research results
+        uses: actions/upload-artifact@v4
+        with:
+          name: unpsychic29-gate1-research
+          path: output/
+          retention-days: 30
