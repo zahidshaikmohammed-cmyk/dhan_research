@@ -23,101 +23,80 @@ jobs:
         run: |
           set -euo pipefail
           python - <<'PY'
-          import csv,io,os,zipfile,urllib.request
+          import csv, os, zipfile, urllib.request
           from pathlib import Path
-          import pandas as pd
-          base='https://github.com/zahidshaikmohammed-cmyk/dhan_research/releases/download/chatgpt-full-data-33258430945'
-          g=pd.read_csv('input/UNPSYCHIC29_GATE2_ALL_500.csv')
-          c=g[(g.range10_pct_median<=1.5109)&(g.eff10_median>=0.45)&(g.late_directional_rate>=0.32927)&(g.opening_flat_rate_005<=0.06707)].symbol.astype(str).tolist()
-          assert len(c)>0
+          with open('input/UNPSYCHIC29_GATE2_ALL_500.csv',newline='') as f:
+              rows=list(csv.DictReader(f))
+          def ok(r):
+              try:
+                  return float(r['range10_pct_median'])<=1.5109 and float(r['eff10_median'])>=0.45 and float(r['late_directional_rate'])>=0.32927 and float(r['opening_flat_rate_005'])<=0.06707
+              except (KeyError,TypeError,ValueError): return False
+          c=[r['symbol'] for r in rows if ok(r)]; assert c, 'Gate 2 produced no candidates'
           wanted=set(c)
+          base='https://github.com/zahidshaikmohammed-cmyk/dhan_research/releases/download/chatgpt-full-data-33258430945'
           for i in (1,2):
-              dst=f'/tmp/data-{i:03d}.zip'
-              urllib.request.urlretrieve(f'{base}/chatgpt-data-{i:03d}.zip',dst)
-              with zipfile.ZipFile(dst) as z:
-                  names=z.namelist()
-                  hits=[n for n in names if '/raw_1min/' in n and Path(n).stem in wanted and n.endswith('.parquet')]
-                  for n in hits:
-                      z.extract(n,'data')
-              os.remove(dst)
-          files=list(Path('data').rglob('raw_1min/*.parquet'))
-          got={p.stem for p in files}
-          missing=sorted(wanted-got)
-          assert not missing, f'missing candidate raw files: {missing}'
-          print('Gate2 candidates:',len(c),'raw files extracted:',len(files))
+              zpath=f'/tmp/data-{i:03d}.zip'; urllib.request.urlretrieve(f'{base}/chatgpt-data-{i:03d}.zip',zpath)
+              with zipfile.ZipFile(zpath) as z:
+                  for n in z.namelist():
+                      p=Path(n)
+                      if n.endswith('.parquet') and '/raw_1min/' in n and p.stem in wanted: z.extract(n,'data')
+              os.remove(zpath)
+          got={p.stem for p in Path('data').rglob('raw_1min/*.parquet')}; missing=sorted(wanted-got)
+          assert not missing, f'Missing Gate 2 candidate raw files: {missing}'
+          print(f'Gate2 candidates={len(c)}, extracted={len(got)}')
           Path('output/GATE2_CANDIDATES.txt').write_text('\n'.join(c)+'\n')
           PY
       - name: Install research engine
-        run: python -m pip install --disable-pip-version-check -q pandas pyarrow duckdb numpy scipy
+        run: python -m pip install --disable-pip-version-check -q pandas pyarrow duckdb numpy
       - name: Compute Gate 3 and final selection
         run: |
           set -euo pipefail
           python - <<'PY'
           from pathlib import Path
           import json, numpy as np, pandas as pd, duckdb
-          out=Path('output'); files=sorted(Path('data').rglob('raw_1min/*.parquet'))
-          rows=[]
+          out=Path('output'); files=sorted(Path('data').rglob('raw_1min/*.parquet')); rows=[]
           for p in files:
-              sym=p.stem; con=duckdb.connect(); con.execute('PRAGMA threads=2')
-              f=str(p).replace("'","''")
-              q=f'''SELECT CAST(timestamp AS TIMESTAMP) ts,CAST(open AS DOUBLE)o,CAST(high AS DOUBLE)h,CAST(low AS DOUBLE)l,CAST(close AS DOUBLE)c FROM read_parquet('{f}') WHERE CAST(timestamp AS TIME)>=TIME '09:25:00' AND CAST(timestamp AS TIME)<TIME '15:31:00' ORDER BY timestamp'''
+              sym=p.stem; f=str(p).replace("'","''"); con=duckdb.connect(); con.execute('PRAGMA threads=2')
+              q=f"SELECT CAST(timestamp AS TIMESTAMP) ts,CAST(high AS DOUBLE) h,CAST(low AS DOUBLE) l,CAST(close AS DOUBLE) cl FROM read_parquet('{f}') WHERE CAST(timestamp AS TIME)>=TIME '09:25:00' AND CAST(timestamp AS TIME)<TIME '15:31:00' ORDER BY timestamp"
               d=con.execute(q).df(); con.close(); d['date']=d.ts.dt.date
               for dt,z in d.groupby('date',sort=True):
                   z=z.reset_index(drop=True)
                   if len(z)<300: continue
-                  cl=z.c.to_numpy(float); hi=z.h.to_numpy(float); lo=z.l.to_numpy(float); p0=cl[0]
-                  r30=100*(cl[29]/p0-1); r60=100*(cl[59]/p0-1); r120=100*(cl[119]/p0-1); r300=100*(cl[299]/p0-1); rc=100*(cl[-1]/p0-1)
-                  y=np.log(cl[:60]); x=np.arange(60); fit=np.polyval(np.polyfit(x,y,1),x); r2=float(1-np.sum((y-fit)**2)/max(np.sum((y-y.mean())**2),1e-12))
-                  ret1=100*np.diff(cl[:61])/cl[:60]; path=float(np.abs(ret1).sum()); eff=float(abs(r60)/path) if path>0 else 0.0
-                  direction=1 if r60>0 else -1 if r60<0 else 0
-                  if direction>0: mfe=100*(hi[:60].max()/p0-1); mae=100*(1-lo[:60].min()/p0)
-                  elif direction<0: mfe=100*(1-lo[:60].min()/p0); mae=100*(hi[:60].max()/p0-1)
-                  else: mfe=mae=0.0
-                  # 5-minute directional switching over first 60 minutes.
-                  b=cl[:61]; five=100*(b[5::5]/b[:-5:5]-1); five=np.asarray(five); signs=np.sign(five); switches=float(np.sum(signs[1:]*signs[:-1]<0)/max(1,len(signs)-1))
-                  rows.append(dict(symbol=sym,trade_date=dt,ret30=r30,ret60=r60,ret120=r120,ret300=r300,retclose=rc,r2=r2,eff=eff,mfe=mfe,mae=mae,switch_rate=switches))
-          s=pd.DataFrame(rows); assert not s.empty
-          s.to_parquet(out/'GATE3_SESSION_METRICS.parquet',index=False)
-          g=s.groupby('symbol')
-          a=g.agg(sessions=('trade_date','count'),ret60=('ret60','median'),ret120=('ret120','median'),ret300=('ret300','median'),r2=('r2','median'),eff=('eff','median'),mfe=('mfe','median'),mae=('mae','median'),switch_rate=('switch_rate','median')).reset_index()
-          a['cont_close']=g.apply(lambda x:float((x.ret60*x.retclose>0).mean())).values
-          a['cont120']=g.apply(lambda x:float((x.ret60*x.ret120>0).mean())).values
-          a['move_rate']=g.apply(lambda x:float((x.ret60.abs()>=0.50).mean())).values
+                  cl=z.cl.to_numpy(float); hi=z.h.to_numpy(float); lo=z.l.to_numpy(float); p0=cl[0]
+                  r60=100*(cl[59]/p0-1); r120=100*(cl[119]/p0-1); r300=100*(cl[299]/p0-1); rc=100*(cl[-1]/p0-1)
+                  yy=np.log(cl[:60]); xx=np.arange(60); fit=np.polyval(np.polyfit(xx,yy,1),xx); r2=float(1-np.sum((yy-fit)**2)/max(np.sum((yy-yy.mean())**2),1e-12))
+                  rets=100*np.diff(cl[:60])/cl[:59]; path=float(np.abs(rets).sum()); eff=float(abs(r60)/path) if path else 0.0
+                  dr=1 if r60>0 else -1 if r60<0 else 0; mfe=float(100*(hi[:60].max()/p0-1)) if dr>0 else float(100*(1-lo[:60].min()/p0)) if dr<0 else 0.0; mae=float(100*(1-lo[:60].min()/p0)) if dr>0 else float(100*(hi[:60].max()/p0-1)) if dr<0 else 0.0
+                  five=100*(cl[4:60:5]/cl[:56:5]-1); signs=np.sign(five); switch=float(np.mean(signs[1:]*signs[:-1]<0)) if len(signs)>1 else 0.0
+                  rows.append(dict(symbol=sym,trade_date=dt,ret60=r60,ret120=r120,ret300=r300,retclose=rc,r2=r2,eff=eff,mfe=mfe,mae=mae,switch=switch))
+          s=pd.DataFrame(rows); assert not s.empty; s.to_parquet(out/'GATE3_SESSION_METRICS.parquet',index=False); g=s.groupby('symbol')
+          a=g.agg(sessions=('trade_date','count'),ret60=('ret60','median'),r2=('r2','median'),eff=('eff','median'),mfe=('mfe','median'),mae=('mae','median'),switch=('switch','median')).reset_index()
+          for col,fn in [('cont_close',lambda x:float((x.ret60*x.retclose>0).mean())),('cont120',lambda x:float((x.ret60*x.ret120>0).mean())),('cont300',lambda x:float((x.ret60*x.ret300>0).mean())),('move_rate',lambda x:float((x.ret60.abs()>=0.50).mean()))]: a[col]=g.apply(fn).values
           a['mfe_mae']=a.mfe/(a.mae+1e-9)
-          # Four chronological blocks; selection requires consistency, with final block kept as holdout validation.
-          dates=np.array(sorted(pd.to_datetime(s.trade_date).unique())); blocks=np.array_split(dates,4); bd=[]
+          dates=np.array(sorted(pd.to_datetime(s.trade_date).unique())); blocks=np.array_split(dates,4); detail=[]
           for bi,b in enumerate(blocks,1):
               z=s[pd.to_datetime(s.trade_date).isin(b)]
-              for sym,x in z.groupby('symbol'):
-                  bd.append(dict(symbol=sym,block=bi,ret=x.ret60.median(),r2=x.r2.median(),eff=x.eff.median(),cont=((x.ret60*x.retclose)>0).mean(),move=(x.ret60.abs()>=.50).mean(),mfe_mae=(x.mfe.median()/(x.mae.median()+1e-9)),switch=x.switch_rate.median()))
-          bd=pd.DataFrame(bd)
-          for col,high in [('ret',True),('r2',True),('eff',True),('cont',True),('move',True),('mfe_mae',True),('switch',False)]:
-              bd[col+'_pass']=bd.groupby('block')[col].transform(lambda x:x>=x.median()) if high else bd.groupby('block')[col].transform(lambda x:x<=x.median())
-          bd['pass']=bd[[c for c in bd if c.endswith('_pass')]].all(axis=1)
-          piv=bd.pivot(index='symbol',columns='block',values='pass').fillna(False); piv.columns=[f'b{x}' for x in piv.columns]; piv=piv.reset_index(); piv['blocks_passed']=piv[[c for c in piv if c.startswith('b')]].sum(axis=1)
-          a=a.merge(piv,on='symbol')
-          # Robust full-sample ranks are used only after the independent Gate 3 behavioral gates.
-          for col in ['r2','eff','cont_close','cont120','move_rate','mfe_mae'] : a[col+'_p']=a[col].rank(pct=True)
-          a['switch_p']=1-a.switch_rate.rank(pct=True)
-          a['stability']=a.blocks_passed/4
-          a['gate3_score']=a[['r2_p','eff_p','cont_close_p','cont120_p','move_rate_p','mfe_mae_p','switch_p']].mean(axis=1)*a.stability
-          # Hard Gate 3: at least 3/4 blocks, positive continuation, meaningful movement, and non-chaotic trend.
-          q=(a.blocks_passed>=3)&(a.cont_close>=0.50)&(a.cont120>=0.50)&(a.move_rate>=0.30)&(a.r2>=0.15)&(a.eff>=0.25)&(a.mfe_mae>=1.10)&(a.switch_rate<=0.50)
-          qual=a[q].copy().sort_values(['gate3_score','blocks_passed','mfe_mae','r2'],ascending=False).reset_index(drop=True)
-          # If more than 29 qualify, select the strongest robust 29. If fewer, do not manufacture weak names.
-          final=qual.head(29).copy(); final.insert(0,'final_rank',np.arange(1,len(final)+1))
-          a.sort_values(['gate3_score','blocks_passed'],ascending=False).to_csv(out/'GATE3_ALL.csv',index=False); bd.to_csv(out/'GATE3_BLOCK_DETAIL.csv',index=False); qual.to_csv(out/'GATE3_QUALIFIED.csv',index=False); final.to_csv(out/'UNPSYCHIC29_FINAL.csv',index=False)
-          report={'gate2_candidates':len(files),'gate3_sessions':len(s),'gate3_qualified':len(qual),'final_count':len(final),'final_exact_29':len(final)==29,'holdout_block_pass_rate':float((final.b4 if len(final) else pd.Series(dtype=float)).mean()) if len(final) else None,'method':'Gate3 uses 30/60/120/300-minute continuation, regression R2, path efficiency, MFE/MAE, directional switching, meaningful-move rate and four chronological blocks. Final selection is downstream of independent hard behavioral gates; no arbitrary 20% filter.'}
-          (out/'UNPSYCHIC29_FINAL_REPORT.json').write_text(json.dumps(report,indent=2,default=str)); print(json.dumps(report,indent=2)); print(final[['final_rank','symbol','blocks_passed','r2','eff','cont_close','cont120','move_rate','mfe_mae']].to_string(index=False))
+              for sym,x in z.groupby('symbol'): detail.append(dict(symbol=sym,block=bi,ret=x.ret60.median(),r2=x.r2.median(),eff=x.eff.median(),cont=((x.ret60*x.retclose)>0).mean(),move=(x.ret60.abs()>=.50).mean(),mfe_mae=x.mfe.median()/(x.mae.median()+1e-9),switch=x.switch.median()))
+          bd=pd.DataFrame(detail); parts=[]
+          for bi,x in bd.groupby('block'):
+              x=x.copy()
+              for col,high in [('ret',1),('r2',1),('eff',1),('cont',1),('move',1),('mfe_mae',1),('switch',0)]:
+                  med=x[col].median(); x[col+'_pass']=x[col]>=med if high else x[col]<=med
+              x['pass']=x[[c for c in x if c.endswith('_pass')]].all(axis=1); parts.append(x)
+          bd=pd.concat(parts); w=bd.pivot(index='symbol',columns='block',values='pass').fillna(False); w.columns=[f'b{x}' for x in w.columns]; w=w.reset_index(); w['blocks_passed']=w[[c for c in w if c.startswith('b')]].sum(axis=1); a=a.merge(w,on='symbol',how='left')
+          for col in ['r2','eff','cont_close','cont120','cont300','move_rate','mfe_mae']: a[col+'_p']=a[col].rank(pct=True)
+          a['switch_p']=1-a.switch.rank(pct=True); a['stability']=a.blocks_passed/4; a['gate3_score']=a[[c for c in a if c.endswith('_p')]].mean(axis=1)*a.stability
+          qual=a[(a.blocks_passed>=3)&(a.cont_close>=.50)&(a.cont120>=.50)&(a.cont300>=.50)&(a.move_rate>=.30)&(a.r2>=.15)&(a.eff>=.25)&(a.mfe_mae>=1.10)&(a.switch<=.50)].sort_values(['gate3_score','blocks_passed','mfe_mae','r2'],ascending=False).reset_index(drop=True); qual.insert(0,'gate3_rank',np.arange(1,len(qual)+1)); final=qual.head(29).copy()
+          a.to_csv(out/'GATE3_ALL.csv',index=False); bd.to_csv(out/'GATE3_BLOCK_DETAIL.csv',index=False); qual.to_csv(out/'GATE3_QUALIFIED.csv',index=False); final.to_csv(out/'UNPSYCHIC29_FINAL.csv',index=False)
+          report={'gate2_candidates':len(files),'gate3_sessions':len(s),'gate3_qualified':len(qual),'final_count':len(final),'final_exact_29':len(final)==29,'last_block_membership':int(final.b4.sum()) if len(final) and 'b4' in final else 0,'method':'Post-09:25 60/120/300-minute continuation, R2, path efficiency, MFE/MAE, directional switching and four chronological stability blocks; no arbitrary 20% filter.'}
+          (out/'UNPSYCHIC29_FINAL_REPORT.json').write_text(json.dumps(report,indent=2,default=str)); print(json.dumps(report,indent=2)); print(final[['gate3_rank','symbol','blocks_passed','r2','eff','cont_close','cont120','cont300','move_rate','mfe_mae']].to_string(index=False))
           PY
       - name: Final validation
         run: |
           python - <<'PY'
           import pandas as pd,json
           x=pd.read_csv('output/UNPSYCHIC29_FINAL.csv'); r=json.load(open('output/UNPSYCHIC29_FINAL_REPORT.json'))
-          assert x.symbol.nunique()==len(x)
-          assert len(x)==29, f'Final qualified universe is {len(x)}, not 29; standards must not be lowered.'
-          assert r['final_count']==29
+          assert len(x)==29 and x.symbol.nunique()==29 and r['final_count']==29 and r['final_exact_29']
           print('UNPSYCHIC29 FINAL VALIDATION PASSED')
           PY
       - uses: actions/upload-artifact@v4
