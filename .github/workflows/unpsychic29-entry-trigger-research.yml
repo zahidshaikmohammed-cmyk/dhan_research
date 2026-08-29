@@ -1,4 +1,5 @@
 name: UNPSYCHIC29 Exact Entry Trigger Research
+# Triggered after the research implementation is committed; this run must produce the exact causal trigger tables.
 on:
   push:
     branches: [main]
