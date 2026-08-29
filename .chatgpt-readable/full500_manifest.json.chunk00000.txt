@@ -1,0 +1,13 @@
+{
+  "status": "OK",
+  "stock_count": 500,
+  "batch_count": 10,
+  "batch_size": 50,
+  "lookback_days": 365,
+  "interval_minutes": 1,
+  "raw_1min_files": 500,
+  "raw_1min_data_persisted": true,
+  "raw_1min_format": "parquet-zstd-per-symbol",
+  "daily_feature_rows": 122262,
+  "trading_days": 246
+}
