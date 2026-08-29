@@ -1,0 +1,258 @@
+name: UNPSYCHIC29 Deep Trading-System Research V1
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  research:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download exact research release
+        shell: bash
+        run: |
+          set -euo pipefail
+          B=https://github.com/zahidshaikmohammed-cmyk/dhan_research/releases/download/chatgpt-full-data-33258430945
+          mkdir -p input data output
+          curl -fL --retry 5 --retry-delay 3 -o /tmp/a.zip "$B/chatgpt-data-001.zip"
+          curl -fL --retry 5 --retry-delay 3 -o /tmp/b.zip "$B/chatgpt-data-002.zip"
+          unzip -q /tmp/a.zip -d data
+          unzip -q /tmp/b.zip -d data
+          rm -f /tmp/a.zip /tmp/b.zip
+      - name: Install research stack
+        run: python -m pip install --disable-pip-version-check -q pandas numpy scipy duckdb pyarrow scikit-learn
+      - name: Deep intraday research on locked 29
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          import json, math
+          import numpy as np
+          import pandas as pd
+          import duckdb
+          from scipy.stats import spearmanr
+          from sklearn.linear_model import LogisticRegression
+          from sklearn.metrics import roc_auc_score
+
+          OUT=Path('output'); OUT.mkdir(exist_ok=True)
+          SYMS=['360ONE','MPHASIS','HCLTECH','POLYMED','JSL','AFFLE','SONACOMS','VEDL','NATIONALUM','JKCEMENT','ZENSARTECH','KEI','TATATECH','LTM','PVRINOX','UNOMINDA','ENDURANCE','RAINBOW','SHREECEM','APTUS','MOTILALOFS','ESCORTS','NATCOPHARM','SPLPETRO','PERSISTENT','TRAVELFOOD','UBL','INDIACEM','BHARTIHEXA']
+          ENTRY=['09:20','09:21','09:22','09:23','09:24','09:25','09:26','09:27','09:28','09:29','09:30','09:35','09:40','09:45','09:50','10:00']
+          ENTRY_MIN=[int(x[:2])*60+int(x[3:]) for x in ENTRY]
+          H=[15,30,60,120,300]
+          con=duckdb.connect(); con.execute('PRAGMA threads=4')
+
+          def ts_minutes(t): return t.hour*60+t.minute
+          def r2_slope(v):
+              v=np.asarray(v,float)
+              if len(v)<3 or np.any(v<=0): return np.nan,np.nan
+              x=np.arange(len(v)); y=np.log(v)
+              b=np.polyfit(x,y,1); fit=np.polyval(b,x)
+              den=np.sum((y-y.mean())**2)
+              r2=1-np.sum((y-fit)**2)/max(den,1e-12)
+              return float(r2),float(100*b[0])
+          def efficiency(v):
+              v=np.asarray(v,float)
+              if len(v)<2:return np.nan
+              path=np.abs(np.diff(v)/v[:-1]).sum()*100
+              return float(abs(100*(v[-1]/v[0]-1))/path) if path>0 else 0.0
+          def side_metrics(z, entry_idx, direction, stop, target, maxbars=120):
+              p=float(z.cl.iloc[entry_idx]); end=min(len(z),entry_idx+1+maxbars)
+              if direction==1:
+                  sl=p*(1-stop/100); tp=p*(1+target/100)
+              else:
+                  sl=p*(1+stop/100); tp=p*(1-target/100)
+              outcome='TIME'; hit_i=end-entry_idx
+              for j in range(entry_idx+1,end):
+                  hi=float(z.h.iloc[j]); lo=float(z.l.iloc[j])
+                  hit_tp=(hi>=tp) if direction==1 else (lo<=tp)
+                  hit_sl=(lo<=sl) if direction==1 else (hi>=sl)
+                  if hit_tp and hit_sl:
+                      outcome='STOP_CONSERVATIVE'; hit_i=j-entry_idx; break
+                  if hit_sl:
+                      outcome='STOP'; hit_i=j-entry_idx; break
+                  if hit_tp:
+                      outcome='TARGET'; hit_i=j-entry_idx; break
+              signed=direction*100*(float(z.cl.iloc[min(end-1,len(z)-1)])/p-1)
+              return outcome,hit_i,signed
+
+          events=[]; integrity=[]
+          for sym in SYMS:
+              paths=sorted(Path('data').rglob(f'raw_1min__{sym}.parquet.chunk*.csv'))
+              if not paths:
+                  paths=sorted(Path('data').rglob(f'raw_1min__{sym}.parquet'))
+              if not paths:
+                  raise RuntimeError(f'No raw data found for locked symbol {sym}')
+              arr=','.join("'"+str(p).replace("'","''")+"'" for p in paths)
+              q=f'''SELECT CAST(timestamp AS TIMESTAMPTZ) AT TIME ZONE 'Asia/Kolkata' ts,CAST(open AS DOUBLE)o,CAST(high AS DOUBLE)h,CAST(low AS DOUBLE)l,CAST(close AS DOUBLE)cl,CAST(volume AS DOUBLE)v FROM read_csv_auto([{arr}],header=true,union_by_name=true,ignore_errors=false) ORDER BY ts'''
+              d=con.execute(q).df(); d['date']=d.ts.dt.date; d['minute']=d.ts.dt.hour*60+d.ts.dt.minute
+              dates=[]
+              for dt,z0 in d.groupby('date',sort=True):
+                  z=z0[(z0.minute>=555)&(z0.minute<=930)].sort_values('ts').reset_index(drop=True)
+                  # No forward fill: only exact observed minute bars are eligible.
+                  if len(z)<360: continue
+                  idx={m:i for i,m in enumerate(z.minute)}
+                  if not all(m in idx for m in ENTRY_MIN): continue
+                  # Previous-session close for the gap; only use actual prior day data.
+                  prior=d[d.date<dt]
+                  if prior.empty: continue
+                  prev_close=float(prior.sort_values('ts').iloc[-1].cl)
+                  dates.append(dt)
+                  for em,elabel in zip(ENTRY_MIN,ENTRY):
+                      ei=idx[em]; p=float(z.cl.iloc[ei]); gap=100*(float(z.o.iloc[idx[555]])/prev_close-1)
+                      def ret(n):
+                          j=ei-n
+                          return 100*(p/float(z.cl.iloc[j])-1) if j>=0 else np.nan
+                      def rng(n):
+                          j=max(0,ei-n+1); return 100*(float(z.h.iloc[j:ei+1].max())-float(z.l.iloc[j:ei+1].min()))/p
+                      def eff(n):
+                          j=max(0,ei-n+1); return efficiency(z.cl.iloc[j:ei+1].to_numpy())
+                      def trend(n):
+                          j=max(0,ei-n+1); return r2_slope(z.cl.iloc[j:ei+1].to_numpy())
+                      feats={'symbol':sym,'trade_date':dt,'entry':elabel,'entry_minute':em,'price':p,'gap_pct':gap}
+                      for n in [1,3,5,10,15,20,30]: feats[f'mom_{n}']=ret(n)
+                      for n in [5,10,15,20,30]: feats[f'range_{n}']=rng(n); feats[f'eff_{n}']=eff(n); feats[f'r2_{n}'],feats[f'slope_{n}']=trend(n)
+                      for n in [3,5,10]: feats[f'upbars_{n}']=float((z.cl.iloc[ei-n+1:ei+1].to_numpy()>z.o.iloc[ei-n+1:ei+1].to_numpy()).mean())
+                      # volume is only used when present and positive; no synthetic volume.
+                      v5=float(z.v.iloc[max(0,ei-4):ei+1].mean()); v20=float(z.v.iloc[max(0,ei-19):ei+1].mean()); vprior=float(z.v.iloc[max(0,ei-39):max(0,ei-19)].mean())
+                      feats['relvol_5_20']=v5/v20 if v20>0 else np.nan; feats['relvol_20_prior']=v20/vprior if vprior>0 else np.nan
+                      # Opening structure and VWAP available only from 09:15 through entry.
+                      op=z.cl.iloc[:ei+1]; hi=z.h.iloc[:ei+1]; lo=z.l.iloc[:ei+1]; vol=z.v.iloc[:ei+1]
+                      feats['open_range_5']=100*(z.h.iloc[:min(ei+1,5)].max()-z.l.iloc[:min(ei+1,5)].min())/float(z.o.iloc[0])
+                      feats['open_range_10']=100*(z.h.iloc[:min(ei+1,10)].max()-z.l.iloc[:min(ei+1,10)].min())/float(z.o.iloc[0])
+                      vw=( ((z.h+z.l+z.cl)/3)*z.v ).iloc[:ei+1].sum()/vol.iloc[:ei+1].sum() if vol.iloc[:ei+1].sum()>0 else np.nan
+                      feats['dist_vwap_pct']=100*(p/vw-1) if pd.notna(vw) and vw>0 else np.nan
+                      for n in [5,10,20]:
+                          j=max(0,ei-n); prevhi=float(z.h.iloc[j:ei].max()) if ei>j else np.nan; prevlo=float(z.l.iloc[j:ei].min()) if ei>j else np.nan
+                          feats[f'breakout_{n}']=1 if p>prevhi else -1 if p<prevlo else 0
+                      for h in H:
+                          j=ei+h
+                          if j<len(z):
+                              feats[f'fwd_{h}']=100*(float(z.cl.iloc[j])/p-1)
+                              feats[f'fwd_high_{h}']=100*(float(z.h.iloc[ei+1:j+1].max())/p-1)
+                              feats[f'fwd_low_{h}']=100*(float(z.l.iloc[ei+1:j+1].min())/p-1)
+                          else: feats[f'fwd_{h}']=np.nan;feats[f'fwd_high_{h}']=np.nan;feats[f'fwd_low_{h}']=np.nan
+                      j=min(len(z)-1,ei+300); feats['fwd_close']=100*(float(z.cl.iloc[j])/p-1)
+                      # Future-direction labels are kept separate from entry features.
+                      for h in [30,60,120]:
+                          fr=feats[f'fwd_{h}']; feats[f'label_up_{h}']=int(fr>0) if pd.notna(fr) else np.nan
+                      events.append(feats)
+              integrity.append({'symbol':sym,'sessions_used':len(dates),'first_session':str(min(dates)) if dates else None,'last_session':str(max(dates)) if dates else None,'raw_rows':len(d),'timestamp_min':str(d.ts.min()),'timestamp_max':str(d.ts.max())})
+              print(sym,len(dates))
+
+          E=pd.DataFrame(events); E.to_parquet(OUT/'ENTRY_EVENT_DATA.parquet',index=False); pd.DataFrame(integrity).to_csv(OUT/'DATA_COVERAGE_29.csv',index=False)
+          # Entry-time sweep: direction is defined by the sign of the observed momentum feature; no future data enters the signal.
+          sweep=[]
+          for ent,g in E.groupby('entry'):
+              for feat in ['mom_3','mom_5','mom_10','mom_15','mom_20','mom_30','eff_5','eff_10','eff_20','r2_10','r2_20','slope_10','slope_20','relvol_5_20','dist_vwap_pct']:
+                  x=g[feat]
+                  for side in ['LONG','SHORT']:
+                      sig=(x>0) if side=='LONG' else (x<0)
+                      # For efficiency/R2/volume use sign of contemporaneous momentum to define direction; magnitude is used as filter.
+                      if feat.startswith(('eff_','r2_','relvol_')):
+                          m=g['mom_10']; sig=(m>0) if side=='LONG' else (m<0)
+                      if feat=='dist_vwap_pct': sig=(x>0) if side=='LONG' else (x<0)
+                      for h in [30,60,120]:
+                          y=g[f'fwd_{h}']
+                          ss=g.loc[sig & y.notna(),f'fwd_{h}']
+                          if len(ss)<50: continue
+                          signed=ss if side=='LONG' else -ss
+                          sweep.append({'entry':ent,'feature':feat,'side':side,'horizon':h,'signals':len(ss),'win_rate':float((signed>0).mean()),'median_signed_return':float(signed.median()),'mean_signed_return':float(signed.mean()),'q25':float(signed.quantile(.25)),'q75':float(signed.quantile(.75))})
+          SW=pd.DataFrame(sweep); SW.to_csv(OUT/'ENTRY_TIME_FEATURE_SWEEP.csv',index=False)
+
+          # Chronological train/validation/test. Thresholds are learned only on train+validation; final numbers are test-only.
+          dates=np.array(sorted(pd.to_datetime(E.trade_date).unique())); cut1=dates[int(len(dates)*.60)]; cut2=dates[int(len(dates)*.80)]
+          E['split']=np.where(pd.to_datetime(E.trade_date)<cut1,'TRAIN',np.where(pd.to_datetime(E.trade_date)<cut2,'VALIDATION','TEST'))
+          features=['mom_3','mom_5','mom_10','mom_15','mom_20','mom_30','eff_5','eff_10','eff_20','r2_10','r2_20','slope_10','slope_20','relvol_5_20','relvol_20_prior','dist_vwap_pct','open_range_5','open_range_10','breakout_5','breakout_10','breakout_20']
+          cand=[]
+          for ent in ENTRY:
+              base=E[E.entry==ent]
+              for feat in features:
+                  if feat not in base: continue
+                  for q in [.50,.60,.70,.80,.90]:
+                      tr=base[base.split!='TEST'][feat].dropna();
+                      if len(tr)<200: continue
+                      threshold=float(tr.abs().quantile(q)) if feat not in ['breakout_5','breakout_10','breakout_20'] else 0.5
+                      for side in ['LONG','SHORT']:
+                          # Direction comes from momentum; candidate filter is magnitude of selected feature.
+                          m=base['mom_10']; direction=(m>0) if side=='LONG' else (m<0)
+                          filt=base[feat].abs()>=threshold if feat not in ['breakout_5','breakout_10','breakout_20'] else (base[feat]==(1 if side=='LONG' else -1))
+                          sig=base[direction & filt]
+                          vv=sig[sig.split=='VALIDATION']; tt=sig[sig.split=='TEST']
+                          if len(vv)<50 or len(tt)<50: continue
+                          vret=(vv.fwd_60 if side=='LONG' else -vv.fwd_60).dropna(); tret=(tt.fwd_60 if side=='LONG' else -tt.fwd_60).dropna()
+                          cand.append({'entry':ent,'feature':feat,'q':q,'threshold':threshold,'side':side,'validation_n':len(vret),'validation_win':float((vret>0).mean()),'validation_mean':float(vret.mean()),'validation_median':float(vret.median()),'test_n':len(tret),'test_win':float((tret>0).mean()),'test_mean':float(tret.mean()),'test_median':float(tret.median())})
+          C=pd.DataFrame(cand); C['val_score']=C.validation_mean*C.validation_win
+          C=C.sort_values(['val_score','validation_mean','validation_win'],ascending=False); C.to_csv(OUT/'SIGNAL_DISCOVERY_CANDIDATES.csv',index=False)
+          best=C.head(50).copy();best.to_csv(OUT/'TOP_SIGNAL_CANDIDATES.csv',index=False)
+
+          # Stock personalities at the empirically strongest entry time for each stock, chosen on validation only.
+          pers=[]
+          for sym,g in E.groupby('symbol'):
+              rows=[]
+              for ent,x in g[g.split=='VALIDATION'].groupby('entry'):
+                  y=x.fwd_60.dropna();
+                  if len(y)<30: continue
+                  rows.append((float(y.abs().median()),ent,float(y.median()),float((y>0).mean()),len(y)))
+              if not rows: continue
+              rows.sort(reverse=True); _,ent,med,up,n=rows[0]
+              z=g[g.entry==ent]
+              pers.append({'symbol':sym,'best_validation_entry_by_abs_move':ent,'validation_median_60m_return':med,'validation_up_rate':up,'validation_events':n,'all_sessions':len(z),'median_gap':z.gap_pct.median(),'median_mom10':z.mom_10.median(),'median_eff10':z.eff_10.median(),'median_r2_20':z.r2_20.median(),'median_relvol':z.relvol_5_20.median(),'test_60m_median':z[z.split=='TEST'].fwd_60.median(),'test_60m_up_rate':(z[z.split=='TEST'].fwd_60>0).mean()})
+          P=pd.DataFrame(pers).sort_values('symbol');P.to_csv(OUT/'STOCK_PERSONALITIES_29.csv',index=False)
+
+          # Stop/target matrix on the top validated signal, evaluated only on TEST, conservative same-bar ambiguity.
+          if len(C):
+              b=C.iloc[0]; sel=E[(E.entry==b.entry)&(E.split=='TEST')].copy(); m=sel.mom_10; filt=(m>0) if b.side=='LONG' else (m<0); threshold=float(b.threshold)
+              if b.feature.startswith('breakout_'): filt=filt & (sel[b.feature]==(1 if b.side=='LONG' else -1))
+              else: filt=filt & (sel[b.feature].abs()>=threshold)
+              sel=sel[filt]
+              # event-level OHLC lookup for selected entries
+              stop_targets=[]
+              for stop in [.20,.30,.40,.50,.75,1.00]:
+                  for target in [.20,.30,.40,.50,.75,1.00,1.50,2.00]:
+                      wins=loss=[]; vals=[]
+                      for _,r in sel.iterrows():
+                          sym=r.symbol;dt=r.trade_date;em=r.entry_minute
+                          paths=sorted(Path('data').rglob(f'raw_1min__{sym}.parquet.chunk*.csv'))
+                          arr=','.join("'"+str(p).replace("'","''")+"'" for p in paths)
+                          q=f"SELECT CAST(timestamp AS TIMESTAMPTZ) AT TIME ZONE 'Asia/Kolkata' ts,CAST(high AS DOUBLE) h,CAST(low AS DOUBLE) l,CAST(close AS DOUBLE) cl FROM read_csv_auto([{arr}],header=true,union_by_name=true,ignore_errors=false) WHERE CAST(timestamp AS DATE)=DATE '{dt}' AND CAST(CAST(timestamp AS TIMESTAMPTZ) AT TIME ZONE 'Asia/Kolkata' AS TIME)>=TIME '{r.entry}' AND CAST(CAST(timestamp AS TIMESTAMPTZ) AT TIME ZONE 'Asia/Kolkata' AS TIME)<=TIME '12:30:00' ORDER BY ts"
+                          zz=con.execute(q).df();
+                          if len(zz)<2: continue
+                          p=float(r.price); direction=1 if b.side=='LONG' else -1; outcome='TIME'; rv=direction*100*(float(zz.cl.iloc[-1])/p-1); hit=0
+                          for j in range(1,len(zz)):
+                              hi=float(zz.h.iloc[j]);lo=float(zz.l.iloc[j]);tp=(hi>=p*(1+target/100)) if direction==1 else (lo<=p*(1-target/100));sl=(lo<=p*(1-stop/100)) if direction==1 else (hi>=p*(1+stop/100))
+                              if sl and tp: outcome='STOP';rv=-stop;hit=j;break
+                              if sl: outcome='STOP';rv=-stop;hit=j;break
+                              if tp: outcome='TARGET';rv=target;hit=j;break
+                          vals.append(rv);wins.append(outcome=='TARGET');loss.append(outcome=='STOP')
+                      if vals:
+                          va=np.array(vals,float);w=np.array(wins);l=np.array(loss)
+                          stop_targets.append({'entry':b.entry,'feature':b.feature,'side':b.side,'stop_pct':stop,'target_pct':target,'n':len(va),'win_rate':float(w.mean()),'loss_rate':float(l.mean()),'mean_return':float(va.mean()),'median_return':float(np.median(va)),'profit_factor':float(va[va>0].sum()/abs(va[va<0].sum())) if np.any(va<0) else np.inf})
+              pd.DataFrame(stop_targets).to_csv(OUT/'STOP_TARGET_TEST_MATRIX.csv',index=False)
+
+          summary={'locked_universe':SYMS,'events':int(len(E)),'entry_times_tested':ENTRY,'horizons':H,'chronological_split':{'train_end':str(cut1),'validation_end':str(cut2),'test_start':str(cut2)},'market_sector_context':'NOT AVAILABLE in supplied repository raw 29-stock dataset; not fabricated','lookahead_policy':'Features use only bars at or before the simulated entry minute; all forward returns/excursions are labels only. No future price/volume is used in feature construction.','outputs':['DATA_COVERAGE_29.csv','ENTRY_EVENT_DATA.parquet','ENTRY_TIME_FEATURE_SWEEP.csv','SIGNAL_DISCOVERY_CANDIDATES.csv','TOP_SIGNAL_CANDIDATES.csv','STOCK_PERSONALITIES_29.csv','STOP_TARGET_TEST_MATRIX.csv']}
+          (OUT/'DEEP_RESEARCH_SUMMARY.json').write_text(json.dumps(summary,indent=2,default=str))
+          print(json.dumps(summary,indent=2));print('\nTOP SIGNALS');print(best.head(20).to_string(index=False))
+          PY
+      - name: Final research integrity validation
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          import pandas as pd,json
+          out=Path('output')
+          cov=pd.read_csv(out/'DATA_COVERAGE_29.csv')
+          assert set(cov.symbol)==set(['360ONE','MPHASIS','HCLTECH','POLYMED','JSL','AFFLE','SONACOMS','VEDL','NATIONALUM','JKCEMENT','ZENSARTECH','KEI','TATATECH','LTM','PVRINOX','UNOMINDA','ENDURANCE','RAINBOW','SHREECEM','APTUS','MOTILALOFS','ESCORTS','NATCOPHARM','SPLPETRO','PERSISTENT','TRAVELFOOD','UBL','INDIACEM','BHARTIHEXA'])
+          for f in ['ENTRY_TIME_FEATURE_SWEEP.csv','SIGNAL_DISCOVERY_CANDIDATES.csv','STOCK_PERSONALITIES_29.csv','DEEP_RESEARCH_SUMMARY.json']:
+              assert (out/f).exists() and (out/f).stat().st_size>0
+          print('UNPSYCHIC29 DEEP RESEARCH V1: INTEGRITY VALIDATION PASSED')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: UNPSYCHIC29-DEEP-RESEARCH-V1
+          path: output/
+          retention-days: 90
