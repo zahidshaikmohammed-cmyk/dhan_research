@@ -1,0 +1,106 @@
+name: UNPSYCHIC29 Gate 1 Gap Analysis
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  gate1:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download complete release data
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG=chatgpt-full-data-33258430945
+          BASE=https://github.com/zahidshaikmohammed-cmyk/dhan_research/releases/download/$TAG
+          mkdir -p input data output
+          curl -fL --retry 5 --retry-delay 3 -o input/001.zip $BASE/chatgpt-data-001.zip
+          curl -fL --retry 5 --retry-delay 3 -o input/002.zip $BASE/chatgpt-data-002.zip
+          curl -fL --retry 5 --retry-delay 3 -o input/manifest.json $BASE/PARQUET_MANIFEST.json
+          unzip -q input/001.zip -d data
+          unzip -q input/002.zip -d data
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check -q pandas pyarrow duckdb numpy
+      - name: Compute Gate 1 across complete daily dataset
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import pandas as pd, numpy as np, json
+          root=Path('data')
+          files=list(root.rglob('daily_features_500*.csv'))
+          if not files:
+              files=[p for p in root.rglob('*.csv') if 'daily_features_500' in p.name]
+          if len(files)!=1: raise RuntimeError(f'Expected exactly one daily_features_500 CSV, found {len(files)}')
+          p=files[0]
+          df=pd.read_csv(p, low_memory=False)
+          req=['symbol','trade_date','previous_close','open','gap_pct']
+          miss=[c for c in req if c not in df.columns]
+          if miss: raise RuntimeError(f'Missing required columns: {miss}')
+          df['trade_date']=pd.to_datetime(df['trade_date'], errors='coerce')
+          for c in ['previous_close','open','gap_pct']:
+              df[c]=pd.to_numeric(df[c], errors='coerce')
+          raw_n=len(df)
+          bad_date=int(df['trade_date'].isna().sum())
+          bad_gap=int(df['gap_pct'].isna().sum())
+          df=df.dropna(subset=['symbol','trade_date','gap_pct']).copy()
+          # Recompute gap independently from source prices and verify source gap_pct.
+          valid_price=(df['previous_close']>0)&df['open'].notna()
+          recomputed=np.where(valid_price, (df['open']/df['previous_close']-1)*100, np.nan)
+          mismatch=np.abs(recomputed-df['gap_pct'])>1e-9
+          mismatch_count=int(np.nansum(mismatch))
+          df['abs_gap_pct']=df['gap_pct'].abs()
+          rows=[]
+          for sym,g in df.groupby('symbol', sort=True):
+              a=g['abs_gap_pct']
+              gap=g['gap_pct']
+              rows.append({
+                  'symbol':sym,'valid_sessions':len(g),
+                  'median_abs_gap_pct':a.median(),'p75_abs_gap_pct':a.quantile(.75),
+                  'p90_abs_gap_pct':a.quantile(.90),'p95_abs_gap_pct':a.quantile(.95),'p99_abs_gap_pct':a.quantile(.99),
+                  'mean_abs_gap_pct':a.mean(),
+                  'gap_up_0.5_rate':(gap>=.5).mean(),'gap_down_0.5_rate':(gap<=-.5).mean(),
+                  'gap_up_0.75_rate':(gap>=.75).mean(),'gap_down_0.75_rate':(gap<=-.75).mean(),
+                  'gap_up_1_rate':(gap>=1).mean(),'gap_down_1_rate':(gap<=-1).mean(),
+                  'large_gap_0.5_rate':(a>=.5).mean(),'large_gap_0.75_rate':(a>=.75).mean(),'large_gap_1_rate':(a>=1).mean(),
+                  'max_abs_gap_pct':a.max(),
+              })
+          out=pd.DataFrame(rows)
+          # Empirical burden ranks; no arbitrary 20% selection and no final-29 truncation.
+          out['gap_burden_rank']=out[['median_abs_gap_pct','p90_abs_gap_pct','p95_abs_gap_pct','large_gap_1_rate']].rank(pct=True).mean(axis=1)
+          out=out.sort_values(['gap_burden_rank','median_abs_gap_pct','p90_abs_gap_pct']).reset_index(drop=True)
+          out.insert(0,'gap_rank',range(1,len(out)+1))
+          out.to_csv('output/UNPSYCHIC29_GATE1_500_STOCKS.csv',index=False)
+          q=[.50,.60,.70,.75,.80,.85,.90,.95,.99]
+          dist=out[['median_abs_gap_pct','p90_abs_gap_pct','p95_abs_gap_pct','large_gap_0.5_rate','large_gap_0.75_rate','large_gap_1_rate','gap_up_1_rate','gap_down_1_rate']].quantile(q)
+          dist.to_csv('output/UNPSYCHIC29_GATE1_DISTRIBUTION.csv')
+          summary=[
+              'UNPSYCHIC29 GATE 1 — COMPLETE EMPIRICAL GAP ANALYSIS',
+              f'Source rows: {raw_n}',f'Rows with invalid trade_date: {bad_date}',f'Rows with invalid gap_pct: {bad_gap}',
+              f'Rows retained for stock analysis: {len(df)}',f'Stocks: {out.symbol.nunique()}',
+              f'Independent gap formula mismatches >1e-9 percentage points: {mismatch_count}',
+              '', 'No arbitrary survivor percentage was applied.',
+              'Gate 1 evidence files: UNPSYCHIC29_GATE1_500_STOCKS.csv and UNPSYCHIC29_GATE1_DISTRIBUTION.csv',
+              '', 'Selected quietest 30 (diagnostic only):',
+              out[['gap_rank','symbol','median_abs_gap_pct','p90_abs_gap_pct','p95_abs_gap_pct','gap_up_1_rate','gap_down_1_rate','large_gap_1_rate']].head(30).to_string(index=False)
+          ]
+          Path('output/UNPSYCHIC29_GATE1_SUMMARY.txt').write_text('\n'.join(summary))
+          PY
+      - name: Commit Gate 1 results
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          mkdir -p research_outputs
+          cp output/UNPSYCHIC29_GATE1_500_STOCKS.csv research_outputs/
+          cp output/UNPSYCHIC29_GATE1_DISTRIBUTION.csv research_outputs/
+          cp output/UNPSYCHIC29_GATE1_SUMMARY.txt research_outputs/
+          git add research_outputs/
+          if git diff --cached --quiet; then echo 'No output changes'; exit 0; fi
+          git commit -m "Add complete UNPSYCHIC29 Gate 1 results"
+          git push
