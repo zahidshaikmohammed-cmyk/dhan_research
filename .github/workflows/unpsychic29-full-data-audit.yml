@@ -1,0 +1,268 @@
+name: UNPSYCHIC29 Full Data Audit
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download release data and validation files
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="chatgpt-full-data-33258430945"
+          BASE="https://github.com/zahidshaikmohammed-cmyk/dhan_research/releases/download/${TAG}"
+          mkdir -p audit_input audit_output
+          curl -fL --retry 5 --retry-delay 5 -o audit_input/chatgpt-data-001.zip "$BASE/chatgpt-data-001.zip"
+          curl -fL --retry 5 --retry-delay 5 -o audit_input/chatgpt-data-002.zip "$BASE/chatgpt-data-002.zip"
+          curl -fL --retry 5 --retry-delay 5 -o audit_input/PARQUET_MANIFEST.json "$BASE/PARQUET_MANIFEST.json"
+          curl -fL --retry 5 --retry-delay 5 -o audit_input/lfs-parts.sha256 "$BASE/lfs-parts.sha256"
+          sha256sum audit_input/chatgpt-data-001.zip audit_input/chatgpt-data-002.zip | tee audit_output/download_sha256.txt
+          cat audit_input/lfs-parts.sha256 | tee audit_output/release_sha256_manifest.txt
+
+      - name: Extract complete CSV export
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf audit_data
+          mkdir -p audit_data
+          unzip -q audit_input/chatgpt-data-001.zip -d audit_data
+          unzip -q audit_input/chatgpt-data-002.zip -d audit_data
+          find audit_data -type f -printf '%p\t%s\n' | sort > audit_output/extracted_files.tsv
+          find audit_data -type f -name '*.csv' | sort > audit_output/csv_inventory.txt
+          echo "CSV_COUNT=$(wc -l < audit_output/csv_inventory.txt)" | tee audit_output/basic_inventory.txt
+          du -sh audit_data | tee -a audit_output/basic_inventory.txt
+
+      - name: Install analysis dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas pyarrow duckdb
+
+      - name: Run complete data-level audit
+        shell: bash
+        run: |
+          python - <<'PY'
+          import csv, glob, hashlib, json, math, os, re, statistics, sys, traceback
+          from pathlib import Path
+          import duckdb
+          import pandas as pd
+
+          ROOT = Path('audit_data')
+          OUT = Path('audit_output')
+          OUT.mkdir(exist_ok=True)
+          manifest_path = Path('audit_input/PARQUET_MANIFEST.json')
+
+          csv_files = sorted(Path(p) for p in glob.glob(str(ROOT / '**' / '*.csv'), recursive=True))
+          manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+
+          report = {
+              'status': 'RUNNING',
+              'csv_file_count': len(csv_files),
+              'manifest_top_level_type': type(manifest).__name__,
+              'errors': [],
+              'files': [],
+              'columns': {},
+              'global': {},
+          }
+
+          # Manifest structural summary without assuming a particular manifest schema.
+          def walk_manifest(x, path=''):
+              out=[]
+              if isinstance(x, dict):
+                  out.append({'path':path or '/', 'type':'object', 'keys':list(x.keys())[:200]})
+                  for k,v in x.items():
+                      out.extend(walk_manifest(v, (path+'.'+k).strip('.')))
+              elif isinstance(x, list):
+                  out.append({'path':path or '/', 'type':'array', 'length':len(x)})
+                  for i,v in enumerate(x[:5]):
+                      out.extend(walk_manifest(v, f'{path}[{i}]'))
+              else:
+                  out.append({'path':path or '/', 'type':type(x).__name__, 'value':x})
+              return out
+          (OUT/'manifest_structure.json').write_text(json.dumps(walk_manifest(manifest), indent=2, default=str), encoding='utf-8')
+
+          con = duckdb.connect(database=':memory:')
+          con.execute("PRAGMA threads=2")
+
+          # Use DuckDB's CSV scanner so every physical CSV row is processed.
+          # We first inspect each file independently for exact row count/schema/errors.
+          all_tables=[]
+          total_rows=0
+          schema_signatures={}
+          timestamp_candidates=set()
+          symbol_candidates=set()
+
+          for idx, path in enumerate(csv_files, 1):
+              rec={'file':str(path.relative_to(ROOT)), 'bytes':path.stat().st_size}
+              try:
+                  rel=str(path).replace("'", "''")
+                  # Read header with Python csv to preserve exact header strings.
+                  with path.open('r', encoding='utf-8-sig', newline='') as f:
+                      reader=csv.reader(f)
+                      header=next(reader)
+                  rec['header']=header
+
+                  # DuckDB auto-detects the actual CSV structure. strict_mode=false lets us count malformed rows separately.
+                  view_name=f'v{idx}'
+                  q=f"CREATE OR REPLACE VIEW {view_name} AS SELECT * FROM read_csv_auto('{rel}', header=true, strict_mode=false, ignore_errors=false, null_padding=false, normalize_names=false)"
+                  con.execute(q)
+                  desc=con.execute(f'DESCRIBE {view_name}').fetchall()
+                  cols=[{'name':r[0],'type':r[1]} for r in desc]
+                  rec['columns']=cols
+                  rec['row_count']=con.execute(f'SELECT COUNT(*) FROM {view_name}').fetchone()[0]
+                  total_rows += rec['row_count']
+                  sig=json.dumps(cols, sort_keys=True)
+                  schema_signatures[sig]=schema_signatures.get(sig,0)+1
+
+                  for c in [r[0] for r in desc]:
+                      lc=c.lower()
+                      if any(k in lc for k in ('timestamp','datetime','date','time')):
+                          timestamp_candidates.add(c)
+                      if any(k in lc for k in ('symbol','ticker','instrument')):
+                          symbol_candidates.add(c)
+
+                  # Per-column null/unique/min/max statistics.
+                  stats=[]
+                  for c,t in desc:
+                      ident='"'+c.replace('"','""')+'"'
+                      try:
+                          nulls=con.execute(f'SELECT COUNT(*) FROM {view_name} WHERE {ident} IS NULL').fetchone()[0]
+                          nonnull=rec['row_count']-nulls
+                          distinct=con.execute(f'SELECT COUNT(DISTINCT {ident}) FROM {view_name}').fetchone()[0]
+                          s={'name':c,'type':t,'null_count':nulls,'nonnull_count':nonnull,'unique_count':distinct}
+                          if t.upper() not in ('VARCHAR','TEXT','DATE','TIMESTAMP','TIMESTAMP WITH TIME ZONE','TIME'):
+                              try:
+                                  mn,mx,avg,med=con.execute(f'SELECT MIN({ident}), MAX({ident}), AVG({ident}), MEDIAN({ident}) FROM {view_name}').fetchone()
+                                  s.update({'min':mn,'max':mx,'mean':avg,'median':med})
+                              except Exception as e:
+                                  s['numeric_stats_error']=str(e)
+                          stats.append(s)
+                          key=c
+                          report['columns'].setdefault(key, {'types':{},'files':0,'rows':0,'null_count':0})
+                          report['columns'][key]['types'][t]=report['columns'][key]['types'].get(t,0)+1
+                          report['columns'][key]['files']+=1
+                          report['columns'][key]['rows']+=rec['row_count']
+                          report['columns'][key]['null_count']+=nulls
+                      except Exception as e:
+                          stats.append({'name':c,'type':t,'error':str(e)})
+                  rec['column_stats']=stats
+
+                  # Exact duplicate-row count using DuckDB's all-column hash surrogate.
+                  try:
+                      col_expr=', '.join('"'+c.replace('"','""')+'"' for c,_ in desc)
+                      rec['duplicate_rows'] = con.execute(f'SELECT COUNT(*) - COUNT(DISTINCT md5(to_json(struct_pack({col_expr})))) FROM {view_name}').fetchone()[0]
+                  except Exception as e:
+                      rec['duplicate_rows_error']=str(e)
+
+                  # Temporal and symbol summaries where identifiable.
+                  tscols=[c for c,_ in desc if any(k in c.lower() for k in ('timestamp','datetime'))]
+                  datecols=[c for c,_ in desc if c.lower() in ('date','session_date','trading_date')]
+                  symcols=[c for c,_ in desc if any(k in c.lower() for k in ('symbol','ticker','instrument'))]
+                  if tscols:
+                      tc=tscols[0].replace('"','""')
+                      try:
+                          rec['timestamp_min'],rec['timestamp_max']=con.execute(f'SELECT MIN("{tc}"), MAX("{tc}") FROM {view_name}').fetchone()
+                          rec['duplicate_timestamps']=con.execute(f'SELECT COUNT(*)-COUNT(DISTINCT "{tc}") FROM {view_name}').fetchone()[0]
+                          rec['timestamp_out_of_order']=con.execute(f'''SELECT COUNT(*) FROM (SELECT "{tc}", LAG("{tc}") OVER () AS prev FROM {view_name}) WHERE prev IS NOT NULL AND "{tc}" < prev''').fetchone()[0]
+                      except Exception as e: rec['timestamp_error']=str(e)
+                  elif datecols:
+                      dc=datecols[0].replace('"','""')
+                      try: rec['date_min'],rec['date_max']=con.execute(f'SELECT MIN("{dc}"), MAX("{dc}") FROM {view_name}').fetchone()
+                      except Exception as e: rec['date_error']=str(e)
+                  if symcols:
+                      sc=symcols[0].replace('"','""')
+                      try: rec['symbol_unique_count']=con.execute(f'SELECT COUNT(DISTINCT "{sc}") FROM {view_name}').fetchone()[0]
+                      except Exception as e: rec['symbol_error']=str(e)
+
+                  report['files'].append(rec)
+                  all_tables.append(view_name)
+              except Exception as e:
+                  rec['error']=str(e)
+                  rec['traceback']=traceback.format_exc()
+                  report['errors'].append(rec)
+                  report['files'].append(rec)
+
+          # Cross-file schema and row totals.
+          report['global']['total_rows'] = total_rows
+          report['global']['schema_signature_count'] = len(schema_signatures)
+          report['global']['schema_signatures'] = [
+              {'file_count':n,'columns':json.loads(sig)} for sig,n in schema_signatures.items()
+          ]
+          report['global']['timestamp_candidate_columns']=sorted(timestamp_candidates)
+          report['global']['symbol_candidate_columns']=sorted(symbol_candidates)
+          report['global']['files_successfully_read']=sum(1 for x in report['files'] if 'error' not in x)
+          report['global']['files_with_errors']=sum(1 for x in report['files'] if 'error' in x)
+          report['global']['total_duplicate_rows']=sum(int(x.get('duplicate_rows',0) or 0) for x in report['files'])
+          report['global']['total_duplicate_timestamps']=sum(int(x.get('duplicate_timestamps',0) or 0) for x in report['files'])
+          report['global']['total_timestamp_out_of_order']=sum(int(x.get('timestamp_out_of_order',0) or 0) for x in report['files'])
+
+          # Global combined views only when schemas are identical.
+          if len(schema_signatures)==1 and all_tables:
+              try:
+                  union=' UNION ALL '.join(f'SELECT * FROM {t}' for t in all_tables)
+                  con.execute(f'CREATE OR REPLACE VIEW all_data AS {union}')
+                  cols=[r[0] for r in con.execute('DESCRIBE all_data').fetchall()]
+                  report['global']['combined_columns']=cols
+                  # Global date/timestamp range and symbol coverage.
+                  for c in cols:
+                      lc=c.lower(); ident='"'+c.replace('"','""')+'"'
+                      if any(k in lc for k in ('timestamp','datetime')) and 'global_timestamp' not in report['global']:
+                          try: report['global']['global_timestamp']=con.execute(f'SELECT MIN({ident}), MAX({ident}) FROM all_data').fetchone()
+                          except: pass
+                      if any(k in lc for k in ('symbol','ticker','instrument')) and 'global_symbol_count' not in report['global']:
+                          try:
+                              report['global']['global_symbol_count']=con.execute(f'SELECT COUNT(DISTINCT {ident}) FROM all_data').fetchone()[0]
+                              syms=con.execute(f'SELECT {ident}, COUNT(*) n FROM all_data GROUP BY 1 ORDER BY 1').fetchall()
+                              pd.DataFrame(syms,columns=['symbol','rows']).to_csv(OUT/'global_symbol_counts.csv',index=False)
+                          except: pass
+              except Exception as e:
+                  report['global']['combined_view_error']=str(e)
+
+          # Write machine-readable outputs.
+          (OUT/'full_audit_report.json').write_text(json.dumps(report, indent=2, default=str), encoding='utf-8')
+          pd.DataFrame(report['files']).to_csv(OUT/'file_level_audit.csv', index=False)
+
+          # Human-readable executive summary.
+          lines=[]
+          lines.append('UNPSYCHIC29 COMPLETE DATA-LEVEL AUDIT')
+          lines.append('='*60)
+          lines.append(f"CSV files found: {len(csv_files)}")
+          lines.append(f"Files successfully read: {report['global']['files_successfully_read']}")
+          lines.append(f"Files with errors: {report['global']['files_with_errors']}")
+          lines.append(f"Total rows read: {report['global']['total_rows']}")
+          lines.append(f"Schema signatures: {report['global']['schema_signature_count']}")
+          lines.append(f"Total duplicate rows detected: {report['global']['total_duplicate_rows']}")
+          lines.append(f"Duplicate timestamps detected: {report['global']['total_duplicate_timestamps']}")
+          lines.append(f"Timestamp chronological violations: {report['global']['total_timestamp_out_of_order']}")
+          lines.append(f"Timestamp candidate columns: {sorted(timestamp_candidates)}")
+          lines.append(f"Symbol candidate columns: {sorted(symbol_candidates)}")
+          if 'global_timestamp' in report['global']: lines.append(f"Global timestamp range: {report['global']['global_timestamp']}")
+          if 'global_symbol_count' in report['global']: lines.append(f"Global symbol count: {report['global']['global_symbol_count']}")
+          lines.append('')
+          lines.append('MANIFEST STRUCTURE: see manifest_structure.json')
+          lines.append('FILE-LEVEL DETAILS: see file_level_audit.csv')
+          lines.append('FULL MACHINE REPORT: see full_audit_report.json')
+          (OUT/'AUDIT_SUMMARY.txt').write_text('\n'.join(lines), encoding='utf-8')
+
+          report['status']='COMPLETE' if not report['errors'] else 'COMPLETE_WITH_ERRORS'
+          (OUT/'full_audit_report.json').write_text(json.dumps(report, indent=2, default=str), encoding='utf-8')
+          print('\n'.join(lines))
+          print('AUDIT_STATUS=', report['status'])
+          PY
+
+      - name: Upload complete audit results
+        uses: actions/upload-artifact@v4
+        with:
+          name: unpsychic29-complete-data-audit
+          path: audit_output/
+          retention-days: 30
