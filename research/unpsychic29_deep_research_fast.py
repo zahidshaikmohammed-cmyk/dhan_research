@@ -35,9 +35,8 @@ for sym in SYMS:
     used=[]
     for dt,z0 in d.groupby('date',sort=True):
         z=z0[(z0.minute>=555)&(z0.minute<=930)].sort_values('ts').reset_index(drop=True)
-        if len(z)<360: continue
         idx={m:i for i,m in enumerate(z.minute)}
-        if not all(m in idx for m in ENTRY_MIN): continue
+        if not all(m in idx for m in ENTRY_MIN) or 555 not in idx: continue
         prior=d[d.date<dt]
         if prior.empty: continue
         prev_close=float(prior.sort_values('ts').iloc[-1].cl); used.append(dt)
@@ -54,7 +53,8 @@ for sym in SYMS:
             f={'symbol':sym,'trade_date':dt,'entry':elabel,'entry_minute':em,'price':p,'gap_pct':gap}
             for n in [1,3,5,10,15,20,30]: f[f'mom_{n}']=ret(n)
             for n in [5,10,15,20,30]: f[f'range_{n}']=rng(n); f[f'eff_{n}']=eff(n); f[f'r2_{n}'],f[f'slope_{n}']=trend(n)
-            for n in [3,5,10]: f[f'upbars_{n}']=float((z.cl.iloc[ei-n+1:ei+1].to_numpy()>z.o.iloc[ei-n+1:ei+1].to_numpy()).mean())
+            for n in [3,5,10]:
+                j=max(0,ei-n+1); f[f'upbars_{n}']=float((z.cl.iloc[j:ei+1].to_numpy()>z.o.iloc[j:ei+1].to_numpy()).mean()) if ei>=j else np.nan
             v5=float(z.v.iloc[max(0,ei-4):ei+1].mean()); v20=float(z.v.iloc[max(0,ei-19):ei+1].mean()); vp=float(z.v.iloc[max(0,ei-39):max(0,ei-19)].mean())
             f['relvol_5_20']=v5/v20 if v20>0 else np.nan; f['relvol_20_prior']=v20/vp if vp>0 else np.nan
             vol=z.v.iloc[:ei+1]; vw=(((z.h+z.l+z.cl)/3)*z.v).iloc[:ei+1].sum()/vol.sum() if vol.sum()>0 else np.nan
@@ -89,7 +89,6 @@ for ent,g in E.groupby('entry'):
                 sweep.append({'entry':ent,'feature':feat,'side':side,'horizon':h,'signals':len(sr),'win_rate':float((sr>0).mean()),'median_signed_return':float(sr.median()),'mean_signed_return':float(sr.mean()),'q25':float(sr.quantile(.25)),'q75':float(sr.quantile(.75))})
 pd.DataFrame(sweep).to_csv(OUT/'ENTRY_TIME_FEATURE_SWEEP.csv',index=False)
 
-# Threshold discovery: thresholds are estimated only from TRAIN+VALIDATION; TEST is untouched until final reporting.
 features=['mom_3','mom_5','mom_10','mom_15','mom_20','mom_30','eff_5','eff_10','eff_20','r2_10','r2_20','slope_10','slope_20','relvol_5_20','relvol_20_prior','dist_vwap_pct','open_range_5','open_range_10','breakout_5','breakout_10','breakout_20']
 cand=[]
 for ent in ENTRY:
@@ -108,7 +107,6 @@ for ent in ENTRY:
                 cand.append({'entry':ent,'feature':feat,'q':q,'threshold':th,'side':side,'validation_n':len(vr),'validation_win':float((vr>0).mean()),'validation_mean':float(vr.mean()),'validation_median':float(vr.median()),'test_n':len(trt),'test_win':float((trt>0).mean()),'test_mean':float(trt.mean()),'test_median':float(trt.median())})
 C=pd.DataFrame(cand); C['val_score']=C.validation_mean*C.validation_win; C=C.sort_values(['val_score','validation_mean','validation_win'],ascending=False); C.to_csv(OUT/'SIGNAL_DISCOVERY_CANDIDATES.csv',index=False); C.head(50).to_csv(OUT/'TOP_SIGNAL_CANDIDATES.csv',index=False)
 
-# Per-stock personality: entry time is chosen from validation only by median absolute 60m movement, then test is reported separately.
 pers=[]
 for sym,g in E.groupby('symbol'):
     rows=[]
@@ -119,7 +117,6 @@ for sym,g in E.groupby('symbol'):
         _,ent,med,up,n=max(rows); z=g[g.entry==ent]; tz=z[z.split=='TEST']; pers.append({'symbol':sym,'best_validation_entry':ent,'validation_median_60m_return':med,'validation_up_rate':up,'validation_events':n,'all_events':len(z),'median_gap_pct':z.gap_pct.median(),'median_mom10_pct':z.mom_10.median(),'median_eff10':z.eff_10.median(),'median_r2_20':z.r2_20.median(),'median_relvol_5_20':z.relvol_5_20.median(),'test_60m_median':tz.fwd_60.median(),'test_60m_up_rate':(tz.fwd_60>0).mean(),'test_events':len(tz)})
 pd.DataFrame(pers).sort_values('symbol').to_csv(OUT/'STOCK_PERSONALITIES_29.csv',index=False)
 
-# Robustness of the chosen discovery direction across chronological quarters.
 blocks=np.array_split(dates,4); bd=[]
 for bi,b in enumerate(blocks,1):
     x=E[pd.to_datetime(E.trade_date).isin(b)]
