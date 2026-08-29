@@ -37,10 +37,10 @@ jobs:
                   hits=[]
                   for n in z.namelist():
                       p=Path(n)
-                      if n.endswith('.parquet') and p.stem in wanted: hits.append(n); z.extract(n,'data')
-                  print(f'archive {i}: matched {len(hits)} candidate parquet files')
+                      if p.suffix.lower() in {'.parquet','.csv'} and p.stem in wanted: hits.append(n); z.extract(n,'data')
+                  print(f'archive {i}: matched {len(hits)} candidate files')
               os.remove(zpath)
-          got={p.stem for p in Path('data').rglob('*.parquet')}; missing=sorted(wanted-got); assert not missing, f'Missing Gate 2 candidate raw files: {missing}'
+          got={p.stem for p in Path('data').rglob('*') if p.is_file() and p.suffix.lower() in {'.parquet','.csv'}}; missing=sorted(wanted-got); assert not missing, f'Missing Gate 2 candidate raw files: {missing}'
           Path('output/GATE2_CANDIDATES.txt').write_text('\n'.join(c)+'\n'); print(f'Gate2 candidates={len(c)}, extracted={len(got)}')
           PY
       - name: Install research engine
@@ -51,10 +51,11 @@ jobs:
           python - <<'PY'
           from pathlib import Path
           import json, numpy as np, pandas as pd, duckdb
-          out=Path('output'); files=sorted(Path('data').rglob('*.parquet')); rows=[]
+          out=Path('output'); files=sorted([p for p in Path('data').rglob('*') if p.is_file() and p.suffix.lower() in {'.parquet','.csv'}]); rows=[]
           for p in files:
               sym=p.stem; f=str(p).replace("'","''"); con=duckdb.connect(); con.execute('PRAGMA threads=2')
-              q=f"SELECT CAST(timestamp AS TIMESTAMP) ts,CAST(high AS DOUBLE) h,CAST(low AS DOUBLE) l,CAST(close AS DOUBLE) cl FROM read_parquet('{f}') WHERE CAST(timestamp AS TIME)>=TIME '09:25:00' AND CAST(timestamp AS TIME)<TIME '15:31:00' ORDER BY timestamp"
+              reader=f"read_parquet('{f}')" if p.suffix.lower()=='.parquet' else f"read_csv_auto('{f}', HEADER=TRUE, IGNORE_ERRORS=TRUE)"
+              q=f"SELECT CAST(timestamp AS TIMESTAMP) ts,CAST(high AS DOUBLE) h,CAST(low AS DOUBLE) l,CAST(close AS DOUBLE) cl FROM {reader} WHERE CAST(timestamp AS TIME)>=TIME '09:25:00' AND CAST(timestamp AS TIME)<TIME '15:31:00' ORDER BY timestamp"
               d=con.execute(q).df(); con.close(); d['date']=d.ts.dt.date
               for dt,z in d.groupby('date',sort=True):
                   z=z.reset_index(drop=True)
