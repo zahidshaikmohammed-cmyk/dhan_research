@@ -1,0 +1,52 @@
+name: UNPSYCHIC29 Exact Entry Trigger Research
+on:
+  push:
+    branches: [main]
+    paths:
+      - research/unpsychic29_entry_trigger_research_v1.py
+      - .github/workflows/unpsychic29-entry-trigger-research.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  trigger-research:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download exact research release
+        shell: bash
+        run: |
+          set -euo pipefail
+          B=https://github.com/zahidshaikmohammed-cmyk/dhan_research/releases/download/chatgpt-full-data-33258430945
+          mkdir -p data output
+          curl -fL --retry 5 --retry-delay 3 -o /tmp/a.zip "$B/chatgpt-data-001.zip"
+          curl -fL --retry 5 --retry-delay 3 -o /tmp/b.zip "$B/chatgpt-data-002.zip"
+          unzip -q /tmp/a.zip -d data
+          unzip -q /tmp/b.zip -d data
+      - name: Install research stack
+        run: python -m pip install --disable-pip-version-check -q pandas numpy duckdb pyarrow
+      - name: Build causal entry-event dataset
+        run: python research/unpsychic29_deep_research_fast.py
+      - name: Research exact entry triggers
+        run: python research/unpsychic29_entry_trigger_research_v1.py
+      - name: Validate trigger research
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import pandas as pd, json
+          out=Path('output')
+          locked={'360ONE','MPHASIS','HCLTECH','POLYMED','JSL','AFFLE','SONACOMS','VEDL','NATIONALUM','JKCEMENT','ZENSARTECH','KEI','TATATECH','LTM','PVRINOX','UNOMINDA','ENDURANCE','RAINBOW','SHREECEM','APTUS','MOTILALOFS','ESCORTS','NATCOPHARM','SPLPETRO','PERSISTENT','TRAVELFOOD','UBL','INDIACEM','BHARTIHEXA'}
+          b=pd.read_csv(out/'ENTRY_TRIGGERS_BEST_BY_STOCK.csv')
+          assert set(b.symbol)<=locked
+          assert len(b)>0
+          for f in ['ENTRY_TRIGGER_CANDIDATES_ALL.csv','ENTRY_TRIGGERS_BEST_BY_STOCK.csv','ENTRY_TRIGGERS_OOS_SURVIVORS.csv','ENTRY_TRIGGER_PROTOCOL.json','ENTRY_TRIGGER_RESEARCH_SUMMARY.json']:
+            assert (out/f).exists() and (out/f).stat().st_size>0, f
+          print('UNPSYCHIC29 EXACT ENTRY TRIGGER RESEARCH VALIDATION PASSED')
+          print(json.loads((out/'ENTRY_TRIGGER_RESEARCH_SUMMARY.json').read_text()))
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: UNPSYCHIC29-ENTRY-TRIGGER-RESEARCH-V1
+          path: output/
+          retention-days: 90
