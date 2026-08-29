@@ -1,0 +1,108 @@
+name: Inspect Research Data
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Checkout repository with LFS
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+          fetch-depth: 1
+
+      - name: Verify LFS objects
+        shell: bash
+        run: |
+          set -euo pipefail
+          git lfs version
+          git lfs pull
+          git lfs ls-files
+          ls -lh *.zip.part* 2>/dev/null || true
+
+      - name: Inspect archive parts
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          files = sorted(Path('.').glob('*.zip.part*'))
+          if len(files) != 3:
+              raise SystemExit(f'Expected 3 archive parts, found {len(files)}: {files}')
+          total = sum(p.stat().st_size for p in files)
+          print('Parts:')
+          for p in files:
+              print(f'  {p.name}: {p.stat().st_size:,} bytes')
+          print(f'Total: {total:,} bytes ({total/1024/1024:.2f} MiB)')
+          for p in files:
+              with p.open('rb') as f:
+                  head = f.read(16)
+              print(f'{p.name} first 16 bytes: {head.hex(" ")}')
+          PY
+
+      - name: Reassemble archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          parts=( *.zip.part001 *.zip.part002 *.zip.part003 )
+          [ -f "${parts[0]}" ] && [ -f "${parts[1]}" ] && [ -f "${parts[2]}" ]
+          base="${parts[0]%.part001}"
+          cat "${parts[0]}" "${parts[1]}" "${parts[2]}" > "$base"
+          ls -lh "$base"
+          file "$base"
+
+      - name: Inspect archive contents
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive=$(find . -maxdepth 1 -type f -name '*.zip' ! -name '*.part*' -printf '%f\n' | head -n 1)
+          if [ -z "$archive" ]; then
+            echo 'No reconstructed .zip found; stopping safely after inspection.'
+            exit 0
+          fi
+          python3 - "$archive" <<'PY'
+          import sys, zipfile
+          archive=sys.argv[1]
+          try:
+              with zipfile.ZipFile(archive) as z:
+                  bad=z.testzip()
+                  print('ZIP: valid/readable')
+                  print('Entries:', len(z.infolist()))
+                  print('Test result:', 'OK' if bad is None else f'CORRUPT: {bad}')
+                  for i, info in enumerate(z.infolist()[:200], 1):
+                      print(f'{i:04d} {info.file_size:>12,} {info.filename}')
+          except zipfile.BadZipFile as e:
+              print('Not a standard ZIP:', e)
+              raise
+          PY
+
+      - name: Write inspection report
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo '# Research data inspection'
+            echo
+            date -u
+            echo
+            echo '## LFS files'
+            git lfs ls-files || true
+            echo
+            echo '## Local files'
+            ls -lh || true
+          } > inspection-report.txt
+
+      - name: Upload inspection report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: research-inspection-report
+          path: inspection-report.txt
+          if-no-files-found: warn
