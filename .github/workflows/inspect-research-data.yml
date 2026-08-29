@@ -166,6 +166,7 @@ jobs:
         run: |
           set -euo pipefail
           TAG="chatgpt-full-data-${GITHUB_RUN_ID}"
+          export TAG
           echo "TAG=$TAG" >> "$GITHUB_ENV"
           gh release create "$TAG" --title "ChatGPT Full Research Data $GITHUB_RUN_ID" --notes "Complete Parquet-to-CSV export of the research dataset. CSV chunks are contiguous and row-count validated. Release assets are kept below the 512 MB ChatGPT per-file upload limit." --prerelease --target main
 
@@ -174,6 +175,7 @@ jobs:
           import os, zipfile, subprocess
 
           target = int(os.environ['TARGET'])
+          tag = os.environ['TAG']
           csvs = sorted(Path('export_work/csv').glob('*.csv'))
           if not csvs:
               raise SystemExit('No CSV chunks were produced.')
@@ -187,7 +189,7 @@ jobs:
 
           def upload(path):
               print(f'UPLOADING {path} ({path.stat().st_size:,} bytes)')
-              subprocess.run(['gh','release','upload',os.environ['TAG'],str(path)], check=True)
+              subprocess.run(['gh','release','upload',tag,str(path)], check=True)
               path.unlink(missing_ok=True)
 
           zpath, zf = open_zip(batch)
@@ -207,7 +209,7 @@ jobs:
           else:
               zpath.unlink(missing_ok=True)
 
-          subprocess.run(['gh','release','upload',os.environ['TAG'],'export_work/PARQUET_MANIFEST.json','lfs-parts.sha256'], check=True)
+          subprocess.run(['gh','release','upload',tag,'export_work/PARQUET_MANIFEST.json','lfs-parts.sha256'], check=True)
           PY
 
       - name: Final integrity check
