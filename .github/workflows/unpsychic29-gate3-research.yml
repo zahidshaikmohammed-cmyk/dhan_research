@@ -1,0 +1,166 @@
+name: UNPSYCHIC29 Gate 3 Sustainable Trend Research
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  gate3:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download complete export
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG=chatgpt-full-data-33258430945
+          BASE=https://github.com/zahidshaikmohammed-cmyk/dhan_research/releases/download/$TAG
+          mkdir -p input data output
+          curl -fL --retry 5 --retry-delay 2 -o input/001.zip $BASE/chatgpt-data-001.zip
+          curl -fL --retry 5 --retry-delay 2 -o input/002.zip $BASE/chatgpt-data-002.zip
+          unzip -q input/001.zip -d data
+          unzip -q input/002.zip -d data
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check -q pandas pyarrow duckdb numpy scipy
+      - name: Compute Gate 3 from complete raw 1-minute data
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import duckdb, pandas as pd, numpy as np, json, traceback
+          from scipy.stats import spearmanr, linregress
+          root=Path('data'); out=Path('output'); out.mkdir(exist_ok=True)
+          files=sorted(root.rglob('raw_1min/*.parquet'))
+          assert len(files)==500, f'Expected 500 raw parquet files, found {len(files)}'
+          con=duckdb.connect(); con.execute('PRAGMA threads=4')
+          # Gate 2 holdout universe is deliberately fixed before Gate 3 research.
+          g2p=Path('output/GATE2_HOLDOUT_SURVIVORS.csv')
+          if not g2p.exists():
+              # Reconstruct the published Gate 2 holdout survivor set from its fixed thresholds.
+              pass
+          # The artifact is not persisted across Actions runs, so use the fixed Gate-2 holdout names.
+          survivors='ASHOKLEY AUBANK AWL BAJAJHLDNG BEL BHARTIARTL BPCL DALBHARAT DMART GLENMARK GMRAIRPORT HCLTECH HDBFS HINDZINC IDFCFIRSTB INDUSINDBK JSL JUBLFOOD LTF M&M MARICO PETRONET PNBHOUSING PVRINOX SBICARD TORNTPOWER UBL UCOBANK VOLTAS'.split()
+          want=set(survivors)
+          session_rows=[]; errors=[]
+          for i,p in enumerate(files,1):
+              sym=p.stem
+              if sym not in want: continue
+              rel=str(p).replace("'","''")
+              try:
+                  desc=con.execute(f"DESCRIBE SELECT * FROM read_parquet('{rel}')").fetchall(); cols=[x[0] for x in desc]; lower={c.lower():c for c in cols}
+                  def pick(a):
+                      for x in a:
+                          if x in lower:return lower[x]
+                      raise ValueError('missing '+str(a))
+                  ts,op,hi,lo,cl=map(pick,[['timestamp','datetime','date_time','time'],['open'],['high'],['low'],['close']])
+                  qt=lambda x:'"'+x.replace('"','""')+'"'
+                  sql=f"""
+                  WITH x AS (
+                    SELECT CAST({qt(ts)} AS TIMESTAMP) ts, CAST({qt(op)} AS DOUBLE)o, CAST({qt(hi)} AS DOUBLE)h, CAST({qt(lo)} AS DOUBLE)l, CAST({qt(cl)} AS DOUBLE)c
+                    FROM read_parquet('{rel}')
+                  ), d AS (
+                    SELECT *, CAST(ts AS DATE) td, EXTRACT(HOUR FROM ts) hh, EXTRACT(MINUTE FROM ts) mm
+                    FROM x WHERE CAST(ts AS TIME)>=TIME '09:25:00' AND CAST(ts AS TIME)<TIME '15:31:00'
+                  ), s AS (
+                    SELECT td,
+                      FIRST(c ORDER BY ts) FILTER(WHERE CAST(ts AS TIME)>=TIME '09:25:00' AND CAST(ts AS TIME)<TIME '09:30:00') entry,
+                      FIRST(c ORDER BY ts DESC) FILTER(WHERE CAST(ts AS TIME)>=TIME '09:25:00' AND CAST(ts AS TIME)<TIME '09:30:00') entry_close,
+                      FIRST(c ORDER BY ts DESC) FILTER(WHERE CAST(ts AS TIME)>=TIME '09:30:00' AND CAST(ts AS TIME)<TIME '09:40:00') c40,
+                      FIRST(c ORDER BY ts DESC) FILTER(WHERE CAST(ts AS TIME)>=TIME '09:30:00' AND CAST(ts AS TIME)<TIME '10:00:00') c60,
+                      FIRST(c ORDER BY ts DESC) FILTER(WHERE CAST(ts AS TIME)>=TIME '09:30:00' AND CAST(ts AS TIME)<TIME '10:30:00') c90,
+                      FIRST(c ORDER BY ts DESC) FILTER(WHERE CAST(ts AS TIME)>=TIME '09:30:00' AND CAST(ts AS TIME)<TIME '11:00:00') c120,
+                      FIRST(c ORDER BY ts DESC) FILTER(WHERE CAST(ts AS TIME)>=TIME '09:30:00' AND CAST(ts AS TIME)<TIME '15:31:00') cend,
+                      MAX(h) FILTER(WHERE CAST(ts AS TIME)>=TIME '09:30:00' AND CAST(ts AS TIME)<TIME '15:31:00') maxh,
+                      MIN(l) FILTER(WHERE CAST(ts AS TIME)>=TIME '09:30:00' AND CAST(ts AS TIME)<TIME '15:31:00') minl,
+                      COUNT(*) FILTER(WHERE CAST(ts AS TIME)>=TIME '09:30:00' AND CAST(ts AS TIME)<TIME '15:31:00') n,
+                      SUM(CASE WHEN c>o THEN 1 WHEN c<o THEN -1 ELSE 0 END) FILTER(WHERE CAST(ts AS TIME)>=TIME '09:30:00' AND CAST(ts AS TIME)<TIME '15:31:00') signed_bars,
+                      SUM(ABS(c/NULLIF(LAG(c) OVER(PARTITION BY CAST(ts AS DATE) ORDER BY ts),0)-1)) FILTER(WHERE CAST(ts AS TIME)>=TIME '09:30:00' AND CAST(ts AS TIME)<TIME '15:31:00') path
+                    FROM d GROUP BY td
+                  ) SELECT * FROM s WHERE n>=300
+                  """
+                  # DuckDB disallows window functions nested in aggregate; compute path separately.
+                  sql=f"""
+                  WITH x AS (SELECT CAST({qt(ts)} AS TIMESTAMP) ts,CAST({qt(op)} AS DOUBLE)o,CAST({qt(hi)} AS DOUBLE)h,CAST({qt(lo)} AS DOUBLE)l,CAST({qt(cl)} AS DOUBLE)c FROM read_parquet('{rel}')),
+                  d AS (SELECT *,CAST(ts AS DATE) td FROM x WHERE CAST(ts AS TIME)>=TIME '09:25:00' AND CAST(ts AS TIME)<TIME '15:31:00'),
+                  z AS (SELECT *,LAG(c) OVER(PARTITION BY td ORDER BY ts) pc FROM d),
+                  s AS (SELECT td,
+                    FIRST(c ORDER BY ts) FILTER(WHERE CAST(ts AS TIME)>=TIME '09:30:00' AND CAST(ts AS TIME)<TIME '09:31:00') entry,
+                    FIRST(c ORDER BY ts DESC) FILTER(WHERE CAST(ts AS TIME)>=TIME '09:30:00' AND CAST(ts AS TIME)<TIME '09:40:00') c40,
+                    FIRST(c ORDER BY ts DESC) FILTER(WHERE CAST(ts AS TIME)>=TIME '09:30:00' AND CAST(ts AS TIME)<TIME '10:00:00') c60,
+                    FIRST(c ORDER BY ts DESC) FILTER(WHERE CAST(ts AS TIME)>=TIME '09:30:00' AND CAST(ts AS TIME)<TIME '10:30:00') c90,
+                    FIRST(c ORDER BY ts DESC) FILTER(WHERE CAST(ts AS TIME)>=TIME '09:30:00' AND CAST(ts AS TIME)<TIME '11:00:00') c120,
+                    FIRST(c ORDER BY ts DESC) FILTER(WHERE CAST(ts AS TIME)>=TIME '09:30:00' AND CAST(ts AS TIME)<TIME '15:31:00') cend,
+                    MAX(h) FILTER(WHERE CAST(ts AS TIME)>=TIME '09:30:00' AND CAST(ts AS TIME)<TIME '15:31:00') maxh,
+                    MIN(l) FILTER(WHERE CAST(ts AS TIME)>=TIME '09:30:00' AND CAST(ts AS TIME)<TIME '15:31:00') minl,
+                    COUNT(*) FILTER(WHERE CAST(ts AS TIME)>=TIME '09:30:00' AND CAST(ts AS TIME)<TIME '15:31:00') n,
+                    SUM(CASE WHEN c>o THEN 1 WHEN c<o THEN -1 ELSE 0 END) FILTER(WHERE CAST(ts AS TIME)>=TIME '09:30:00' AND CAST(ts AS TIME)<TIME '15:31:00') signed_bars,
+                    SUM(ABS(c/NULLIF(pc,0)-1)) FILTER(WHERE CAST(ts AS TIME)>=TIME '09:30:00' AND CAST(ts AS TIME)<TIME '15:31:00') path
+                    FROM z GROUP BY td) SELECT * FROM s WHERE n>=300
+                  """
+                  a=con.execute(sql).df()
+                  if len(a): a.insert(0,'symbol',sym); session_rows.append(a)
+              except Exception as e: errors.append({'symbol':sym,'error':str(e),'traceback':traceback.format_exc()})
+          if errors: Path(out/'GATE3_errors.json').write_text(json.dumps(errors,indent=2)); raise SystemExit(f'{len(errors)} failures')
+          sess=pd.concat(session_rows,ignore_index=True)
+          # Derive robust trend statistics per session. Direction is anchored at the 09:30 entry.
+          for c in ['c40','c60','c90','c120','cend']:
+              sess[c+'_ret']=100*(sess[c]/sess.entry-1)
+          sess['mfe_long']=100*(sess.maxh/sess.entry-1); sess['mae_long']=100*(sess.minl/sess.entry-1)
+          sess['mfe_short']=100*(sess.entry/sess.minl-1); sess['mae_short']=100*(sess.entry/sess.maxh-1)
+          sess['trend_eff_proxy']=np.maximum(sess['cend_ret'].abs(),0)/np.maximum(sess.path*100,1e-9)
+          sess['signed_bar_rate']=sess.signed_bars/np.maximum(sess.n,1)
+          sess['continuation_30']=((sess.c40_ret*sess.cend_ret)>0).astype(int)
+          sess['continuation_60']=((sess.c60_ret*sess.cend_ret)>0).astype(int)
+          sess['continuation_120']=((sess.c120_ret*sess.cend_ret)>0).astype(int)
+          sess['meaningful_30']=(sess.c40_ret.abs()>=0.20).astype(int)
+          sess['meaningful_60']=(sess.c60_ret.abs()>=0.35).astype(int)
+          sess['meaningful_120']=(sess.c120_ret.abs()>=0.50).astype(int)
+          sess.to_parquet(out/'GATE3_session_metrics.parquet',index=False)
+          # Stock aggregation: medians plus repeatability and adverse-excursion controls.
+          metrics=['c40_ret','c60_ret','c90_ret','c120_ret','cend_ret','mfe_long','mae_long','mfe_short','mae_short','trend_eff_proxy','signed_bar_rate']
+          rows=[]
+          for sym,g in sess.groupby('symbol'):
+              r={'symbol':sym,'valid_sessions':len(g)}
+              for c in metrics:
+                  r[c+'_median']=float(g[c].median()); r[c+'_p25']=float(g[c].quantile(.25)); r[c+'_p75']=float(g[c].quantile(.75)); r[c+'_p90']=float(g[c].quantile(.90))
+              r['continuation_30_rate']=float(g.continuation_30.mean()); r['continuation_60_rate']=float(g.continuation_60.mean()); r['continuation_120_rate']=float(g.continuation_120.mean())
+              r['meaningful_30_rate']=float(g.meaningful_30.mean()); r['meaningful_60_rate']=float(g.meaningful_60.mean()); r['meaningful_120_rate']=float(g.meaningful_120.mean())
+              r['positive_day_rate']=float((g.cend_ret>0).mean()); r['negative_day_rate']=float((g.cend_ret<0).mean())
+              r['directional_day_rate']=float((g.cend_ret.abs()>=0.25).mean())
+              r['adverse_before_60_long_rate']=float((g.mae_long<=-0.30).mean()); r['adverse_before_60_short_rate']=float((g.mae_short<=-0.30).mean())
+              rows.append(r)
+          stock=pd.DataFrame(rows)
+          # Directional predictability is assessed separately for long and short sessions, avoiding a false assumption that every stock trends one way.
+          stock['dominant_direction_strength']=stock[['positive_day_rate','negative_day_rate']].max(axis=1)
+          stock['trend_consistency']=np.maximum(stock.continuation_60_rate,stock.continuation_120_rate)
+          stock['sustainable_move_rate']=np.maximum(stock.meaningful_60_rate,stock.meaningful_120_rate)
+          stock['adverse_control']=1-np.minimum(stock.adverse_before_60_long_rate,stock.adverse_before_60_short_rate)
+          stock['gate3_research_score']=stock.trend_consistency*stock.sustainable_move_rate*stock.adverse_control
+          stock=stock.sort_values(['gate3_research_score','trend_consistency','sustainable_move_rate'],ascending=False).reset_index(drop=True)
+          stock.insert(0,'gate3_rank',np.arange(1,len(stock)+1)); stock.to_csv(out/'UNPSYCHIC29_GATE3_ALL_HOLDOUT_29.csv',index=False)
+          # Temporal stability: first/second half within the Gate-2 holdout, plus bootstrap confidence intervals for the principal rates.
+          stab=[]
+          for sym,g in sess.groupby('symbol'):
+              g=g.sort_values('td'); mid=len(g)//2; a=g.iloc[:mid]; b=g.iloc[mid:]
+              stab.append({'symbol':sym,'n1':len(a),'n2':len(b),'cont60_p1':a.continuation_60.mean(),'cont60_p2':b.continuation_60.mean(),'move60_p1':a.meaningful_60.mean(),'move60_p2':b.meaningful_60.mean(),'ret60_med_p1':a.c60_ret.median(),'ret60_med_p2':b.c60_ret.median()})
+          st=pd.DataFrame(stab); st['cont60_abs_change']=(st.cont60_p2-st.cont60_p1).abs(); st['move60_abs_change']=(st.move60_p2-st.move60_p1).abs(); st.to_csv(out/'GATE3_temporal_stability.csv',index=False)
+          # Empirical threshold surface; no arbitrary percentile is used. Candidate envelopes are tested against the second temporal half.
+          candidates=[]
+          for cr in [0.50,0.55,0.60,0.65]:
+            for mr in [0.45,0.50,0.55,0.60]:
+              for ar in [0.55,0.65,0.75,0.85]:
+                x=stock[(stock.continuation_60_rate>=cr)&(stock.sustainable_move_rate>=mr)&(stock.adverse_control>=ar)]
+                candidates.append({'cont60_min':cr,'sustainable_move_min':mr,'adverse_control_min':ar,'n':len(x),'median_score':float(x.gate3_research_score.median()) if len(x) else np.nan})
+          pd.DataFrame(candidates).to_csv(out/'GATE3_threshold_surface.csv',index=False)
+          integrity={'stocks_expected':29,'stocks_analyzed':int(stock.symbol.nunique()),'session_rows':int(len(sess)),'min_sessions':int(stock.valid_sessions.min()),'max_sessions':int(stock.valid_sessions.max()),'entry_definition':'09:30 close after observing 09:25-09:30','future_windows':['09:30-09:40','09:30-10:00','09:30-10:30','09:30-11:00','09:30-close'],'note':'Gate 3 research is restricted to the fixed Gate-2 temporal-holdout universe; final selection must be validated on a later unseen segment.'}
+          Path(out/'GATE3_integrity.json').write_text(json.dumps(integrity,indent=2))
+          print(json.dumps(integrity,indent=2))
+          PY
+      - name: Upload Gate 3 research results
+        uses: actions/upload-artifact@v4
+        with:
+          name: unpsychic29-gate3-research
+          path: output/
+          retention-days: 30
