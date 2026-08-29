@@ -1,4 +1,4 @@
-name: Extract Research Data
+name: Full ChatGPT Research Export
 
 on:
   workflow_dispatch:
@@ -6,10 +6,15 @@ on:
 permissions:
   contents: write
 
+env:
+  CHATGPT_CHUNK_BYTES: "41943040"
+  RELEASE_ASSET_TARGET_BYTES: "450000000"
+
 jobs:
-  extract:
+  export:
     runs-on: ubuntu-latest
     timeout-minutes: 360
+
     steps:
       - name: Checkout repository with LFS
         uses: actions/checkout@v4
@@ -18,122 +23,200 @@ jobs:
           fetch-depth: 1
           persist-credentials: true
 
-      - name: Pull and verify LFS data
+      - name: Pull and verify all LFS parts
         shell: bash
         run: |
           set -euo pipefail
           git lfs pull
-          test -f *.zip.part001
-          test -f *.zip.part002
-          test -f *.zip.part003
+          parts=( *.zip.part001 *.zip.part002 *.zip.part003 )
+          for p in "${parts[@]}"; do test -f "$p"; done
+          sha256sum "${parts[@]}" > lfs-parts.sha256
 
-      - name: Reassemble archive
+      - name: Reassemble and validate archive
         shell: bash
         run: |
           set -euo pipefail
           p1=$(find . -maxdepth 1 -type f -name '*.zip.part001' -print -quit)
           p2=$(find . -maxdepth 1 -type f -name '*.zip.part002' -print -quit)
           p3=$(find . -maxdepth 1 -type f -name '*.zip.part003' -print -quit)
-          archive="research-reconstructed.zip"
-          cat "$p1" "$p2" "$p3" > "$archive"
-          unzip -t "$archive"
+          cat "$p1" "$p2" "$p3" > research-reconstructed.zip
+          unzip -t research-reconstructed.zip
 
-      - name: Extract archive
+      - name: Extract research archive
         shell: bash
         run: |
           set -euo pipefail
-          rm -rf extracted readable
-          mkdir -p extracted readable
+          rm -rf extracted export_work
+          mkdir -p extracted export_work
           unzip -q research-reconstructed.zip -d extracted
-          find extracted -type f -printf '%p\t%s bytes\n' | sort > readable/FILE_MANIFEST.tsv
+          find extracted -type f -print0 | sort -z | xargs -0 -r sha256sum > export_work/extracted-sha256.txt
 
-      - name: Build ChatGPT-readable chunks
+      - name: Install exact conversion dependency
         shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check --no-input pyarrow
+          python3 -c 'import pyarrow; print(pyarrow.__version__)'
+
+      - name: Stream every Parquet file into ChatGPT-readable CSV chunks
+        shell: bash
+        env:
+          CHUNK_BYTES: ${{ env.CHATGPT_CHUNK_BYTES }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
           from pathlib import Path
-          import csv, json, os, shutil
+          import csv
+          import hashlib
+          import json
+          import os
+          import sys
+          import pyarrow.parquet as pq
 
           ROOT = Path('extracted')
-          OUT = Path('readable')
-          MAX = 4 * 1024 * 1024
-          supported = {'.txt','.csv','.tsv','.json','.jsonl','.ndjson','.log','.md'}
+          OUT = Path('export_work/csv')
+          OUT.mkdir(parents=True, exist_ok=True)
+          LIMIT = int(os.environ['CHUNK_BYTES'])
+          manifest = []
+          total_rows = 0
+          total_sources = 0
 
-          def write_chunks(name, text):
-              safe = name.replace('\\','_').replace('/','__')
-              base = OUT / safe
-              n = 0
-              start = 0
-              while start < len(text):
-                  end = min(len(text), start + MAX)
-                  if end < len(text):
-                      cut = text.rfind('\n', start, end)
-                      if cut > start + MAX//2:
-                          end = cut + 1
-                  (OUT / f'{safe}.chunk{n:05d}.txt').write_text(text[start:end], encoding='utf-8', errors='replace')
-                  n += 1
-                  start = end
-              return n
+          parquet_files = sorted(ROOT.rglob('*.parquet'))
+          if not parquet_files:
+              raise SystemExit('No Parquet files found in extracted research archive.')
 
-          report=[]
-          for p in sorted(x for x in ROOT.rglob('*') if x.is_file()):
-              rel=p.relative_to(ROOT).as_posix()
-              ext=p.suffix.lower()
-              try:
-                  if ext not in supported:
-                      report.append(f'SKIPPED\t{rel}\t{p.stat().st_size}\tunsupported extension {ext or "[none]"}')
-                      continue
-                  if ext in {'.csv','.tsv'}:
-                      delim=',' if ext=='.csv' else '\t'
-                      with p.open('r', encoding='utf-8', errors='replace', newline='') as f:
-                          rows=list(csv.reader(f, delimiter=delim))
-                      text='\n'.join(delim.join(row) for row in rows)+'\n'
-                  elif ext in {'.json'}:
-                      data=json.loads(p.read_text(encoding='utf-8', errors='replace'))
-                      text=json.dumps(data, ensure_ascii=False, indent=2)+'\n'
+          for src in parquet_files:
+              pf = pq.ParquetFile(src)
+              schema = pf.schema_arrow
+              columns = schema.names
+              source_sha = hashlib.sha256(src.read_bytes()).hexdigest()
+              source_rows = pf.metadata.num_rows
+              total_sources += 1
+              total_rows += source_rows
+
+              safe = src.relative_to(ROOT).as_posix().replace('/', '__')
+              chunk_no = 0
+              rows_in_source = 0
+              current = None
+              writer = None
+              current_bytes = 0
+
+              def open_chunk(n):
+                  path = OUT / f'{safe}.chunk{n:05d}.csv'
+                  f = path.open('w', encoding='utf-8', newline='')
+                  w = csv.writer(f, lineterminator='\n')
+                  w.writerow(columns)
+                  f.flush()
+                  return path, f, w, f.tell()
+
+              def close_chunk(path, f, n, rows):
+                  if f is None:
+                      return
+                  f.flush(); f.close()
+                  if rows:
+                      print(f'WROTE {path} rows={rows} bytes={path.stat().st_size:,}')
                   else:
-                      text=p.read_text(encoding='utf-8', errors='replace')
-                  count=write_chunks(rel, text)
-                  report.append(f'EXTRACTED\t{rel}\t{p.stat().st_size}\t{count} chunks')
-              except Exception as e:
-                  report.append(f'ERROR\t{rel}\t{p.stat().st_size}\t{type(e).__name__}: {e}')
+                      path.unlink(missing_ok=True)
 
-          (OUT/'READ_ME_FIRST.txt').write_text(
-              'ChatGPT-readable research extraction\n\n'
-              'Each *.chunk*.txt file contains a contiguous section of an extracted source file.\n'
-              'Original source paths and sizes are in FILE_MANIFEST.tsv.\n\n'
-              + '\n'.join(report) + '\n', encoding='utf-8')
+              for batch in pf.iter_batches(batch_size=25000, use_threads=True):
+                  records = batch.to_pylist()
+                  for rec in records:
+                      if current is None:
+                          current, fh, writer, current_bytes = open_chunk(chunk_no)
+                          chunk_no += 1
+                          rows_in_chunk = 0
+                      row = [rec.get(c) for c in columns]
+                      # csv.writer preserves the complete scalar value representation
+                      # without dropping columns, nulls, timestamps, or decimal values.
+                      writer.writerow(row)
+                      rows_in_chunk += 1
+                      rows_in_source += 1
+                      fh.flush()
+                      if fh.tell() >= LIMIT:
+                          close_chunk(current, fh, chunk_no, rows_in_chunk)
+                          current = fh = writer = None
+                          rows_in_chunk = 0
+
+              close_chunk(current, fh, chunk_no, rows_in_chunk if current else 0)
+              if rows_in_source != source_rows:
+                  raise SystemExit(f'ROW COUNT MISMATCH: {src}: expected {source_rows}, converted {rows_in_source}')
+
+              manifest.append({
+                  'source': src.relative_to(ROOT).as_posix(),
+                  'sha256': source_sha,
+                  'rows': source_rows,
+                  'columns': columns,
+                  'chunks': chunk_no,
+                  'schema': str(schema),
+              })
+
+          (Path('export_work') / 'PARQUET_MANIFEST.json').write_text(
+              json.dumps({'files': manifest, 'total_files': total_sources, 'total_rows': total_rows}, indent=2, default=str),
+              encoding='utf-8')
+          print(f'TOTAL PARQUET FILES: {total_sources}')
+          print(f'TOTAL ROWS: {total_rows:,}')
           PY
 
-      - name: Commit readable data when within GitHub limits
+      - name: Build release assets under ChatGPT upload limits
         shell: bash
+        env:
+          TARGET: ${{ env.RELEASE_ASSET_TARGET_BYTES }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          total=$(du -sb readable | awk '{print $1}')
-          echo "Readable output: $total bytes"
-          if [ "$total" -gt 1000000000 ]; then
-            echo 'Readable output exceeds 1 GB; keeping it as an Actions artifact instead of committing it.'
-            exit 0
-          fi
-          rm -rf .chatgpt-readable
-          mkdir .chatgpt-readable
-          cp -a readable/. .chatgpt-readable/
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add .chatgpt-readable
-          if git diff --cached --quiet; then
-            echo 'No readable files to commit.'
-          else
-            git commit -m 'Add ChatGPT-readable research chunks'
-            git push origin HEAD:main
-          fi
+          TAG="chatgpt-full-data-${GITHUB_RUN_ID}"
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+          gh release create "$TAG" --title "ChatGPT Full Research Data $GITHUB_RUN_ID" --notes "Complete Parquet-to-CSV export of the research dataset. CSV chunks are contiguous and row-count validated. Assets are kept below the 512 MB ChatGPT per-file upload limit." --prerelease --target main
 
-      - name: Upload readable extraction artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: chatgpt-readable-research
-          path: readable/
-          if-no-files-found: warn
-          retention-days: 7
+          python3 - <<'PY'
+          from pathlib import Path
+          import os, zipfile, subprocess
+
+          target = int(os.environ['TARGET'])
+          csvs = sorted(Path('export_work/csv').glob('*.csv'))
+          if not csvs:
+              raise SystemExit('No CSV chunks were produced.')
+
+          batch = 1
+          zf = None
+          zpath = None
+
+          def open_zip(n):
+              path = Path(f'export_work/chatgpt-data-{n:03d}.zip')
+              return path, zipfile.ZipFile(path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6)
+
+          def upload(path):
+              print(f'UPLOADING {path} ({path.stat().st_size:,} bytes)')
+              subprocess.run(['gh','release','upload',os.environ['TAG'],str(path)], check=True)
+              path.unlink(missing_ok=True)
+
+          zpath, zf = open_zip(batch)
+          for src in csvs:
+              zf.write(src, arcname=src.name)
+              src.unlink()
+              zf.fp.flush()
+              size = zpath.stat().st_size
+              if size >= target:
+                  zf.close()
+                  upload(zpath)
+                  batch += 1
+                  zpath, zf = open_zip(batch)
+
+          zf.close()
+          if zpath.stat().st_size == 0:
+              zpath.unlink(missing_ok=True)
+          else:
+              upload(zpath)
+
+          # Add the manifests as a tiny final asset.
+          subprocess.run(['gh','release','upload',os.environ['TAG'],'export_work/PARQUET_MANIFEST.json','lfs-parts.sha256'], check=True)
+          PY
+
+      - name: Final integrity check
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release view "$TAG" --json assets --jq '.assets[] | [.name,.size] | @tsv'
+          test "$(gh release view "$TAG" --json assets --jq '.assets | length')" -ge 2
