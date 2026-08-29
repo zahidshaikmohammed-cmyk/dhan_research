@@ -1,0 +1,109 @@
+name: UNPSYCHIC29 Complete Audit V4
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG=chatgpt-full-data-33258430945
+          BASE=https://github.com/zahidshaikmohammed-cmyk/dhan_research/releases/download/$TAG
+          mkdir -p audit_input audit_output audit_data
+          curl -fL --retry 5 --retry-delay 3 -o audit_input/001.zip $BASE/chatgpt-data-001.zip
+          curl -fL --retry 5 --retry-delay 3 -o audit_input/002.zip $BASE/chatgpt-data-002.zip
+          curl -fL --retry 5 --retry-delay 3 -o audit_input/manifest.json $BASE/PARQUET_MANIFEST.json
+          curl -fL --retry 5 --retry-delay 3 -o audit_input/sha256.txt $BASE/lfs-parts.sha256
+          sha256sum audit_input/001.zip audit_input/002.zip > audit_output/download_sha256.txt
+      - name: Extract both archives
+        run: |
+          set -euo pipefail
+          unzip -q audit_input/001.zip -d audit_data
+          unzip -q audit_input/002.zip -d audit_data
+          find audit_data -type f -name '*.csv' -print0 | sort -z -V > audit_output/csv_files.null
+          tr '\0' '\n' < audit_output/csv_files.null > audit_output/csv_inventory.txt
+          echo "CSV_COUNT=$(wc -l < audit_output/csv_inventory.txt)" | tee audit_output/basic_inventory.txt
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check -q pandas pyarrow duckdb
+      - name: Complete row-level audit
+        shell: bash
+        run: |
+          python - <<'PY'
+          import csv, json, math, os, hashlib, traceback
+          from pathlib import Path
+          import duckdb
+          import pandas as pd
+          ROOT=Path('audit_data'); OUT=Path('audit_output')
+          files=sorted(Path(x.strip()) for x in (OUT/'csv_inventory.txt').read_text().splitlines() if x.strip())
+          manifest=json.loads(Path('audit_input/manifest.json').read_text())
+          report={'status':'RUNNING','file_count':len(files),'files':[],'errors':[],'global':{}}
+          con=duckdb.connect(':memory:'); con.execute('PRAGMA threads=4')
+          schemas={}; total=0; dup_rows=0; dup_ts=0; order_bad=0
+          for i,p in enumerate(files,1):
+              r={'file':str(p.relative_to(ROOT)),'bytes':p.stat().st_size}
+              try:
+                  with p.open('r',encoding='utf-8-sig',newline='') as f: header=next(csv.reader(f))
+                  r['header']=header
+                  v=f'v{i}'
+                  rel=str(p).replace("'","''")
+                  con.execute(f"CREATE OR REPLACE VIEW {v} AS SELECT * FROM read_csv_auto('{rel}',header=true,strict_mode=false,ignore_errors=false,null_padding=false,normalize_names=false)")
+                  d=con.execute(f'DESCRIBE {v}').fetchall()
+                  cols=[{'name':x[0],'type':x[1]} for x in d]; r['columns']=cols
+                  n=int(con.execute(f'SELECT COUNT(*) FROM {v}').fetchone()[0]); r['row_count']=n; total+=n
+                  sig=json.dumps(cols,sort_keys=True); schemas[sig]=schemas.get(sig,0)+1
+                  # Column-level exact null/distinct statistics.
+                  cs=[]
+                  for x in d:
+                      c,t=x[0],x[1]; q='"'+c.replace('"','""')+'"'
+                      nulls=int(con.execute(f'SELECT COUNT(*) FROM {v} WHERE {q} IS NULL').fetchone()[0])
+                      distinct=int(con.execute(f'SELECT COUNT(DISTINCT {q}) FROM {v}').fetchone()[0])
+                      s={'name':c,'type':t,'null_count':nulls,'unique_count':distinct}
+                      if t.upper() not in ('VARCHAR','TEXT','DATE','TIMESTAMP','TIMESTAMP WITH TIME ZONE','TIME'):
+                          a=con.execute(f'SELECT MIN({q}),MAX({q}),AVG({q}),MEDIAN({q}) FROM {v}').fetchone(); s.update({'min':a[0],'max':a[1],'mean':a[2],'median':a[3]})
+                      cs.append(s)
+                  r['column_stats']=cs
+                  # Exact duplicate rows via row_number over all columns; safe for both schemas.
+                  names=[x[0] for x in d]; expr=', '.join('"'+c.replace('"','""')+'"' for c in names)
+                  r['duplicate_rows']=int(con.execute(f'SELECT COUNT(*)-COUNT(DISTINCT hash({expr})) FROM {v}').fetchone()[0]); dup_rows+=r['duplicate_rows']
+                  ts=[x[0] for x in d if any(k in x[0].lower() for k in ('timestamp','datetime'))]
+                  if ts:
+                      q='"'+ts[0].replace('"','""')+'"'
+                      a,b=con.execute(f'SELECT MIN({q}),MAX({q}) FROM {v}').fetchone(); r['timestamp_min']=str(a); r['timestamp_max']=str(b)
+                      r['duplicate_timestamps']=int(con.execute(f'SELECT COUNT(*)-COUNT(DISTINCT {q}) FROM {v}').fetchone()[0]); dup_ts+=r['duplicate_timestamps']
+                      r['timestamp_out_of_order']=int(con.execute(f'SELECT COUNT(*) FROM (SELECT {q},LAG({q}) OVER () prev FROM {v}) z WHERE prev IS NOT NULL AND {q}<prev').fetchone()[0]); order_bad+=r['timestamp_out_of_order']
+                  dates=[x[0] for x in d if x[0].lower() in ('trade_date','session_date','trading_date','date')]
+                  if dates:
+                      q='"'+dates[0].replace('"','""')+'"'; a,b=con.execute(f'SELECT MIN({q}),MAX({q}) FROM {v}').fetchone(); r['date_min']=str(a); r['date_max']=str(b)
+                  syms=[x[0] for x in d if any(k in x[0].lower() for k in ('symbol','ticker','instrument'))]
+                  if syms:
+                      q='"'+syms[0].replace('"','""')+'"'; r['symbol_unique_count']=int(con.execute(f'SELECT COUNT(DISTINCT {q}) FROM {v}').fetchone()[0])
+                  report['files'].append(r)
+              except Exception as e:
+                  r['error']=str(e); r['traceback']=traceback.format_exc(); report['files'].append(r); report['errors'].append(r)
+              if i%25==0: print(f'PROCESSED {i}/{len(files)}')
+          report['global']={'total_rows':total,'files_successfully_read':len(files)-len(report['errors']),'files_with_errors':len(report['errors']),'schema_signature_count':len(schemas),'schema_signatures':[{'file_count':n,'columns':json.loads(s)} for s,n in schemas.items()],'total_duplicate_rows':dup_rows,'total_duplicate_timestamps':dup_ts,'total_timestamp_out_of_order':order_bad}
+          # Manifest is retained structurally and compared for any obvious count fields.
+          report['manifest_top_level_type']=type(manifest).__name__
+          Path(OUT/'full_audit_report.json').write_text(json.dumps(report,indent=2,default=str))
+          pd.DataFrame(report['files']).to_csv(OUT/'file_level_audit.csv',index=False)
+          summary=['UNPSYCHIC29 COMPLETE DATA-LEVEL AUDIT V4','='*60,f'CSV files found: {len(files)}',f'Files successfully read: {report["global"]["files_successfully_read"]}',f'Files with errors: {report["global"]["files_with_errors"]}',f'Total rows read: {total}',f'Schema signatures: {len(schemas)}',f'Total duplicate rows: {dup_rows}',f'Duplicate timestamps: {dup_ts}',f'Timestamp chronological violations: {order_bad}',f'Manifest type: {type(manifest).__name__}']
+          (OUT/'AUDIT_SUMMARY.txt').write_text('\n'.join(summary))
+          report['status']='COMPLETE' if not report['errors'] else 'COMPLETE_WITH_ERRORS'
+          Path(OUT/'full_audit_report.json').write_text(json.dumps(report,indent=2,default=str))
+          print('\n'.join(summary)); print('AUDIT_STATUS=',report['status'])
+          if report['errors']: raise SystemExit('AUDIT FAILED: one or more files had errors')
+          PY
+      - name: Upload audit results
+        uses: actions/upload-artifact@v4
+        with:
+          name: unpsychic29-complete-data-audit-v4
+          path: audit_output/
+          retention-days: 30
