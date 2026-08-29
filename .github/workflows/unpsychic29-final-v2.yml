@@ -1,0 +1,109 @@
+name: UNPSYCHIC29 Final V2
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+permissions:
+  contents: read
+jobs:
+  research:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download Gate 2 artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p input data output
+          gh run download 33266330446 -n unpsychic29-gate2-research-v4 -D input
+          test -s input/GATE2_session_metrics.parquet
+          test -s input/UNPSYCHIC29_GATE2_ALL_500.csv
+      - name: Download raw data
+        run: |
+          set -euo pipefail
+          B=https://github.com/zahidshaikmohammed-cmyk/dhan_research/releases/download/chatgpt-full-data-33258430945
+          curl -fL --retry 5 -o /tmp/a.zip $B/chatgpt-data-001.zip
+          curl -fL --retry 5 -o /tmp/b.zip $B/chatgpt-data-002.zip
+          unzip -q /tmp/a.zip -d data
+          unzip -q /tmp/b.zip -d data
+      - name: Install
+        run: python -m pip install -q pandas pyarrow duckdb numpy
+      - name: Gate 3 deep research
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import pandas as pd,numpy as np,duckdb,json
+          out=Path('output');out.mkdir(exist_ok=True)
+          g=pd.read_csv('input/UNPSYCHIC29_GATE2_ALL_500.csv')
+          # Established Gate-2 empirical envelope.
+          c=g[(g.range10_pct_median<=1.5109)&(g.eff10_median>=.45)&(g.late_directional_rate>=.32927)&(g.opening_flat_rate_005<=.06707)].symbol.tolist()
+          assert c
+          con=duckdb.connect();con.execute('PRAGMA threads=4')
+          rows=[]
+          for p in sorted(Path('data').rglob('raw_1min/*.parquet')):
+            sym=p.stem
+            if sym not in c: continue
+            f=str(p).replace("'","''")
+            q=f"SELECT CAST(timestamp AS TIMESTAMP) ts,CAST(open AS DOUBLE)o,CAST(high AS DOUBLE)h,CAST(low AS DOUBLE)l,CAST(close AS DOUBLE)cl FROM read_parquet('{f}') WHERE CAST(timestamp AS TIME)>=TIME '09:25:00' AND CAST(timestamp AS TIME)<TIME '15:31:00' ORDER BY timestamp"
+            d=con.execute(q).df();d['date']=d.ts.dt.date
+            for dt,z in d.groupby('date'):
+              z=z.reset_index(drop=True)
+              if len(z)<300: continue
+              p0=z.iloc[0].cl
+              # Evaluate 60m, 120m, 300m and near-close behavior from the 9:25 reference.
+              vals={}
+              for mins,idx in [(60,59),(120,119),(300,299)]:
+                if idx<len(z): vals[f'ret{mins}']=100*(z.iloc[idx].cl/p0-1)
+              vals['ret_close']=100*(z.iloc[-1].cl/p0-1)
+              y=np.log(z.cl.to_numpy());x=np.arange(len(y));
+              # 60-minute trend fit uses the first 60 bars after 9:25.
+              yy=y[:60];xx=x[:60];coef=np.polyfit(xx,yy,1);fit=np.polyval(coef,xx);vals['r2_60']=1-np.sum((yy-fit)**2)/max(np.sum((yy-yy.mean())**2),1e-12)
+              path=100*np.abs(np.diff(z.cl.iloc[:60].to_numpy()/z.cl.iloc[:60].shift(1).to_numpy())).sum();vals['eff_60']=abs(vals.get('ret60',0))/path if path else 0
+              dr=1 if vals.get('ret60',0)>0 else -1 if vals.get('ret60',0)<0 else 0
+              vals['mfe']=100*((z.h.iloc[:60].max()/p0-1) if dr>0 else (1-z.l.iloc[:60].min()/p0) if dr<0 else 0)
+              vals['mae']=100*((1-z.l.iloc[:60].min()/p0) if dr>0 else (z.h.iloc[:60].max()/p0-1) if dr<0 else 0)
+              vals['symbol']=sym;vals['trade_date']=dt;rows.append(vals)
+          s=pd.DataFrame(rows);assert len(s)>0
+          agg=[]
+          for sym,z in s.groupby('symbol'):
+            agg.append({'symbol':sym,'sessions':len(z),'ret60_median':z.ret60.median(),'ret60_positive':(z.ret60>0).mean(),'r2_median':z.r2_60.median(),'eff60_median':z.eff_60.median(),'continuation_60_close':((z.ret60*z.ret_close)>0).mean(),'continuation_60_120':((z.ret60*z.ret120)>0).mean(),'strong60_rate':(z.ret60.abs()>=.50).mean(),'strong_close_rate':(z.ret_close.abs()>=.75).mean(),'mfe_median':z.mfe.median(),'mae_median':z.mae.median(),'mfe_mae':(z.mfe/(z.mae+1e-9)).median(),'ret60_iqr':z.ret60.quantile(.75)-z.ret60.quantile(.25)})
+          a=pd.DataFrame(agg)
+          dates=np.array(sorted(pd.to_datetime(s.trade_date).unique()));blocks=np.array_split(dates,4);detail=[]
+          for bi,b in enumerate(blocks,1):
+            z=s[pd.to_datetime(s.trade_date).isin(b)]
+            for sym,x in z.groupby('symbol'):
+              detail.append({'symbol':sym,'block':bi,'ret60':x.ret60.median(),'r2':x.r2_60.median(),'eff':x.eff_60.median(),'cont':((x.ret60*x.ret_close)>0).mean(),'strong':(x.ret60.abs()>=.50).mean(),'mae':x.mae.median()})
+          d=pd.DataFrame(detail);bp=[]
+          for bi,x in d.groupby('block'):
+            x=x.copy()
+            for col,positive in [('ret60',True),('r2',True),('eff',True),('cont',True),('strong',True),('mae',False)]:
+              med=x[col].median();x[col+'_pass']=x[col]>=med if positive else x[col]<=med
+            x['all_pass']=x[[c for c in x.columns if c.endswith('_pass')]].all(axis=1);bp.append(x)
+          bp=pd.concat(bp);w=bp.pivot(index='symbol',columns='block',values='all_pass').fillna(False);w.columns=[f'b{b}' for b in w.columns];w=w.reset_index();w['blocks_passed']=w[[c for c in w.columns if c.startswith('b')]].sum(axis=1)
+          a=a.merge(w,on='symbol',how='left')
+          def rank(v): return v.rank(pct=True)
+          for col in ['r2_median','eff60_median','continuation_60_close','continuation_60_120','strong60_rate','mfe_mae']: a[col+'_p']=rank(a[col])
+          a['mae_p']=1-rank(a.mae_median);a['stability']=a.blocks_passed/4
+          a['gate3_score']=(a[[c for c in a.columns if c.endswith('_p')]].sum(axis=1)/7)*a.stability
+          a=a.sort_values(['gate3_score','blocks_passed','mfe_mae','r2_median'],ascending=False).reset_index(drop=True);a.insert(0,'gate3_rank',np.arange(1,len(a)+1))
+          a.to_csv(out/'GATE3_ALL.csv',index=False);bp.to_csv(out/'GATE3_BLOCK_DETAIL.csv',index=False)
+          final=a[a.blocks_passed>=3].head(29).copy();final.to_csv(out/'UNPSYCHIC29_FINAL.csv',index=False)
+          report={'gate2_candidates':len(c),'gate3_candidates':len(a),'stable_ge3':int((a.blocks_passed>=3).sum()),'final_count':len(final),'validation':'four chronological blocks; independent multi-horizon trend, efficiency, continuation, excursion and persistence measures'}
+          Path(out/'UNPSYCHIC29_REPORT.json').write_text(json.dumps(report,indent=2));print(json.dumps(report,indent=2));print(final[['gate3_rank','symbol','blocks_passed','r2_median','eff60_median','continuation_60_close','mfe_mae']].to_string(index=False))
+          PY
+      - name: Validate
+        run: |
+          python - <<'PY'
+          import pandas as pd,json
+          x=pd.read_csv('output/UNPSYCHIC29_FINAL.csv');r=json.load(open('output/UNPSYCHIC29_REPORT.json'))
+          assert len(x)==29 and x.symbol.nunique()==29 and r['final_count']==29
+          print('UNPSYCHIC29 VALIDATED')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: unpsychic29-final-v2
+          path: output/
+          retention-days: 90
