@@ -51,7 +51,7 @@ jobs:
           unzip -q research-reconstructed.zip -d extracted
           find extracted -type f -print0 | sort -z | xargs -0 -r sha256sum > export_work/extracted-sha256.txt
 
-      - name: Install exact conversion dependency
+      - name: Install conversion dependency
         shell: bash
         run: |
           set -euo pipefail
@@ -70,7 +70,6 @@ jobs:
           import hashlib
           import json
           import os
-          import sys
           import pyarrow.parquet as pq
 
           ROOT = Path('extracted')
@@ -89,7 +88,11 @@ jobs:
               pf = pq.ParquetFile(src)
               schema = pf.schema_arrow
               columns = schema.names
-              source_sha = hashlib.sha256(src.read_bytes()).hexdigest()
+              h = hashlib.sha256()
+              with src.open('rb') as sf:
+                  for block in iter(lambda: sf.read(8 * 1024 * 1024), b''):
+                      h.update(block)
+              source_sha = h.hexdigest()
               source_rows = pf.metadata.num_rows
               total_sources += 1
               total_rows += source_rows
@@ -98,8 +101,8 @@ jobs:
               chunk_no = 0
               rows_in_source = 0
               current = None
+              fh = None
               writer = None
-              current_bytes = 0
 
               def open_chunk(n):
                   path = OUT / f'{safe}.chunk{n:05d}.csv'
@@ -107,9 +110,9 @@ jobs:
                   w = csv.writer(f, lineterminator='\n')
                   w.writerow(columns)
                   f.flush()
-                  return path, f, w, f.tell()
+                  return path, f, w
 
-              def close_chunk(path, f, n, rows):
+              def close_chunk(path, f, rows):
                   if f is None:
                       return
                   f.flush(); f.close()
@@ -118,26 +121,24 @@ jobs:
                   else:
                       path.unlink(missing_ok=True)
 
+              rows_in_chunk = 0
               for batch in pf.iter_batches(batch_size=25000, use_threads=True):
                   records = batch.to_pylist()
                   for rec in records:
                       if current is None:
-                          current, fh, writer, current_bytes = open_chunk(chunk_no)
+                          current, fh, writer = open_chunk(chunk_no)
                           chunk_no += 1
                           rows_in_chunk = 0
-                      row = [rec.get(c) for c in columns]
-                      # csv.writer preserves the complete scalar value representation
-                      # without dropping columns, nulls, timestamps, or decimal values.
-                      writer.writerow(row)
+                      writer.writerow([rec.get(c) for c in columns])
                       rows_in_chunk += 1
                       rows_in_source += 1
                       fh.flush()
                       if fh.tell() >= LIMIT:
-                          close_chunk(current, fh, chunk_no, rows_in_chunk)
+                          close_chunk(current, fh, rows_in_chunk)
                           current = fh = writer = None
                           rows_in_chunk = 0
 
-              close_chunk(current, fh, chunk_no, rows_in_chunk if current else 0)
+              close_chunk(current, fh, rows_in_chunk if current else 0)
               if rows_in_source != source_rows:
                   raise SystemExit(f'ROW COUNT MISMATCH: {src}: expected {source_rows}, converted {rows_in_source}')
 
@@ -166,7 +167,7 @@ jobs:
           set -euo pipefail
           TAG="chatgpt-full-data-${GITHUB_RUN_ID}"
           echo "TAG=$TAG" >> "$GITHUB_ENV"
-          gh release create "$TAG" --title "ChatGPT Full Research Data $GITHUB_RUN_ID" --notes "Complete Parquet-to-CSV export of the research dataset. CSV chunks are contiguous and row-count validated. Assets are kept below the 512 MB ChatGPT per-file upload limit." --prerelease --target main
+          gh release create "$TAG" --title "ChatGPT Full Research Data $GITHUB_RUN_ID" --notes "Complete Parquet-to-CSV export of the research dataset. CSV chunks are contiguous and row-count validated. Release assets are kept below the 512 MB ChatGPT per-file upload limit." --prerelease --target main
 
           python3 - <<'PY'
           from pathlib import Path
@@ -178,8 +179,7 @@ jobs:
               raise SystemExit('No CSV chunks were produced.')
 
           batch = 1
-          zf = None
-          zpath = None
+          zpath, zf = None, None
 
           def open_zip(n):
               path = Path(f'export_work/chatgpt-data-{n:03d}.zip')
@@ -195,20 +195,18 @@ jobs:
               zf.write(src, arcname=src.name)
               src.unlink()
               zf.fp.flush()
-              size = zpath.stat().st_size
-              if size >= target:
+              if zpath.stat().st_size >= target:
                   zf.close()
                   upload(zpath)
                   batch += 1
                   zpath, zf = open_zip(batch)
 
           zf.close()
-          if zpath.stat().st_size == 0:
-              zpath.unlink(missing_ok=True)
-          else:
+          if zpath.stat().st_size:
               upload(zpath)
+          else:
+              zpath.unlink(missing_ok=True)
 
-          # Add the manifests as a tiny final asset.
           subprocess.run(['gh','release','upload',os.environ['TAG'],'export_work/PARQUET_MANIFEST.json','lfs-parts.sha256'], check=True)
           PY
 
