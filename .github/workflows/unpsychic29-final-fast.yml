@@ -25,26 +25,23 @@ jobs:
           python - <<'PY'
           import csv, os, zipfile, urllib.request
           from pathlib import Path
-          with open('input/UNPSYCHIC29_GATE2_ALL_500.csv',newline='') as f:
-              rows=list(csv.DictReader(f))
+          with open('input/UNPSYCHIC29_GATE2_ALL_500.csv',newline='') as f: rows=list(csv.DictReader(f))
           def ok(r):
-              try:
-                  return float(r['range10_pct_median'])<=1.5109 and float(r['eff10_median'])>=0.45 and float(r['late_directional_rate'])>=0.32927 and float(r['opening_flat_rate_005'])<=0.06707
+              try: return float(r['range10_pct_median'])<=1.5109 and float(r['eff10_median'])>=0.45 and float(r['late_directional_rate'])>=0.32927 and float(r['opening_flat_rate_005'])<=0.06707
               except (KeyError,TypeError,ValueError): return False
-          c=[r['symbol'] for r in rows if ok(r)]; assert c, 'Gate 2 produced no candidates'
-          wanted=set(c)
+          c=[r['symbol'] for r in rows if ok(r)]; assert c; wanted=set(c)
           base='https://github.com/zahidshaikmohammed-cmyk/dhan_research/releases/download/chatgpt-full-data-33258430945'
           for i in (1,2):
               zpath=f'/tmp/data-{i:03d}.zip'; urllib.request.urlretrieve(f'{base}/chatgpt-data-{i:03d}.zip',zpath)
               with zipfile.ZipFile(zpath) as z:
+                  hits=[]
                   for n in z.namelist():
                       p=Path(n)
-                      if n.endswith('.parquet') and '/raw_1min/' in n and p.stem in wanted: z.extract(n,'data')
+                      if n.endswith('.parquet') and p.stem in wanted: hits.append(n); z.extract(n,'data')
+                  print(f'archive {i}: matched {len(hits)} candidate parquet files')
               os.remove(zpath)
-          got={p.stem for p in Path('data').rglob('raw_1min/*.parquet')}; missing=sorted(wanted-got)
-          assert not missing, f'Missing Gate 2 candidate raw files: {missing}'
-          print(f'Gate2 candidates={len(c)}, extracted={len(got)}')
-          Path('output/GATE2_CANDIDATES.txt').write_text('\n'.join(c)+'\n')
+          got={p.stem for p in Path('data').rglob('*.parquet')}; missing=sorted(wanted-got); assert not missing, f'Missing Gate 2 candidate raw files: {missing}'
+          Path('output/GATE2_CANDIDATES.txt').write_text('\n'.join(c)+'\n'); print(f'Gate2 candidates={len(c)}, extracted={len(got)}')
           PY
       - name: Install research engine
         run: python -m pip install --disable-pip-version-check -q pandas pyarrow duckdb numpy
@@ -54,7 +51,7 @@ jobs:
           python - <<'PY'
           from pathlib import Path
           import json, numpy as np, pandas as pd, duckdb
-          out=Path('output'); files=sorted(Path('data').rglob('raw_1min/*.parquet')); rows=[]
+          out=Path('output'); files=sorted(Path('data').rglob('*.parquet')); rows=[]
           for p in files:
               sym=p.stem; f=str(p).replace("'","''"); con=duckdb.connect(); con.execute('PRAGMA threads=2')
               q=f"SELECT CAST(timestamp AS TIMESTAMP) ts,CAST(high AS DOUBLE) h,CAST(low AS DOUBLE) l,CAST(close AS DOUBLE) cl FROM read_parquet('{f}') WHERE CAST(timestamp AS TIME)>=TIME '09:25:00' AND CAST(timestamp AS TIME)<TIME '15:31:00' ORDER BY timestamp"
