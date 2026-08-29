@@ -1,13 +1,13 @@
-name: Inspect Research Data
+name: Extract Research Data
 
 on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  inspect:
+  extract:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     steps:
@@ -16,93 +16,124 @@ jobs:
         with:
           lfs: true
           fetch-depth: 1
+          persist-credentials: true
 
-      - name: Verify LFS objects
+      - name: Pull and verify LFS data
         shell: bash
         run: |
           set -euo pipefail
-          git lfs version
           git lfs pull
-          git lfs ls-files
-          ls -lh *.zip.part* 2>/dev/null || true
-
-      - name: Inspect archive parts
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          from pathlib import Path
-          files = sorted(Path('.').glob('*.zip.part*'))
-          if len(files) != 3:
-              raise SystemExit(f'Expected 3 archive parts, found {len(files)}: {files}')
-          total = sum(p.stat().st_size for p in files)
-          print('Parts:')
-          for p in files:
-              print(f'  {p.name}: {p.stat().st_size:,} bytes')
-          print(f'Total: {total:,} bytes ({total/1024/1024:.2f} MiB)')
-          for p in files:
-              with p.open('rb') as f:
-                  head = f.read(16)
-              print(f'{p.name} first 16 bytes: {head.hex(" ")}')
-          PY
+          test -f *.zip.part001
+          test -f *.zip.part002
+          test -f *.zip.part003
 
       - name: Reassemble archive
         shell: bash
         run: |
           set -euo pipefail
-          parts=( *.zip.part001 *.zip.part002 *.zip.part003 )
-          [ -f "${parts[0]}" ] && [ -f "${parts[1]}" ] && [ -f "${parts[2]}" ]
-          base="${parts[0]%.part001}"
-          cat "${parts[0]}" "${parts[1]}" "${parts[2]}" > "$base"
-          ls -lh "$base"
-          file "$base"
+          p1=$(find . -maxdepth 1 -type f -name '*.zip.part001' -print -quit)
+          p2=$(find . -maxdepth 1 -type f -name '*.zip.part002' -print -quit)
+          p3=$(find . -maxdepth 1 -type f -name '*.zip.part003' -print -quit)
+          archive="research-reconstructed.zip"
+          cat "$p1" "$p2" "$p3" > "$archive"
+          unzip -t "$archive"
 
-      - name: Inspect archive contents
+      - name: Extract archive
         shell: bash
         run: |
           set -euo pipefail
-          archive=$(find . -maxdepth 1 -type f -name '*.zip' ! -name '*.part*' -printf '%f\n' | head -n 1)
-          if [ -z "$archive" ]; then
-            echo 'No reconstructed .zip found; stopping safely after inspection.'
-            exit 0
-          fi
-          python3 - "$archive" <<'PY'
-          import sys, zipfile
-          archive=sys.argv[1]
-          try:
-              with zipfile.ZipFile(archive) as z:
-                  bad=z.testzip()
-                  print('ZIP: valid/readable')
-                  print('Entries:', len(z.infolist()))
-                  print('Test result:', 'OK' if bad is None else f'CORRUPT: {bad}')
-                  for i, info in enumerate(z.infolist()[:200], 1):
-                      print(f'{i:04d} {info.file_size:>12,} {info.filename}')
-          except zipfile.BadZipFile as e:
-              print('Not a standard ZIP:', e)
-              raise
+          rm -rf extracted readable
+          mkdir -p extracted readable
+          unzip -q research-reconstructed.zip -d extracted
+          find extracted -type f -printf '%p\t%s bytes\n' | sort > readable/FILE_MANIFEST.tsv
+
+      - name: Build ChatGPT-readable chunks
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import csv, json, os, shutil
+
+          ROOT = Path('extracted')
+          OUT = Path('readable')
+          MAX = 4 * 1024 * 1024
+          supported = {'.txt','.csv','.tsv','.json','.jsonl','.ndjson','.log','.md'}
+
+          def write_chunks(name, text):
+              safe = name.replace('\\','_').replace('/','__')
+              base = OUT / safe
+              n = 0
+              start = 0
+              while start < len(text):
+                  end = min(len(text), start + MAX)
+                  if end < len(text):
+                      cut = text.rfind('\n', start, end)
+                      if cut > start + MAX//2:
+                          end = cut + 1
+                  (OUT / f'{safe}.chunk{n:05d}.txt').write_text(text[start:end], encoding='utf-8', errors='replace')
+                  n += 1
+                  start = end
+              return n
+
+          report=[]
+          for p in sorted(x for x in ROOT.rglob('*') if x.is_file()):
+              rel=p.relative_to(ROOT).as_posix()
+              ext=p.suffix.lower()
+              try:
+                  if ext not in supported:
+                      report.append(f'SKIPPED\t{rel}\t{p.stat().st_size}\tunsupported extension {ext or "[none]"}')
+                      continue
+                  if ext in {'.csv','.tsv'}:
+                      delim=',' if ext=='.csv' else '\t'
+                      with p.open('r', encoding='utf-8', errors='replace', newline='') as f:
+                          rows=list(csv.reader(f, delimiter=delim))
+                      text='\n'.join(delim.join(row) for row in rows)+'\n'
+                  elif ext in {'.json'}:
+                      data=json.loads(p.read_text(encoding='utf-8', errors='replace'))
+                      text=json.dumps(data, ensure_ascii=False, indent=2)+'\n'
+                  else:
+                      text=p.read_text(encoding='utf-8', errors='replace')
+                  count=write_chunks(rel, text)
+                  report.append(f'EXTRACTED\t{rel}\t{p.stat().st_size}\t{count} chunks')
+              except Exception as e:
+                  report.append(f'ERROR\t{rel}\t{p.stat().st_size}\t{type(e).__name__}: {e}')
+
+          (OUT/'READ_ME_FIRST.txt').write_text(
+              'ChatGPT-readable research extraction\n\n'
+              'Each *.chunk*.txt file contains a contiguous section of an extracted source file.\n'
+              'Original source paths and sizes are in FILE_MANIFEST.tsv.\n\n'
+              + '\n'.join(report) + '\n', encoding='utf-8')
           PY
 
-      - name: Write inspection report
-        if: always()
+      - name: Commit readable data when within GitHub limits
         shell: bash
         run: |
           set -euo pipefail
-          {
-            echo '# Research data inspection'
-            echo
-            date -u
-            echo
-            echo '## LFS files'
-            git lfs ls-files || true
-            echo
-            echo '## Local files'
-            ls -lh || true
-          } > inspection-report.txt
+          total=$(du -sb readable | awk '{print $1}')
+          echo "Readable output: $total bytes"
+          if [ "$total" -gt 1000000000 ]; then
+            echo 'Readable output exceeds 1 GB; keeping it as an Actions artifact instead of committing it.'
+            exit 0
+          fi
+          rm -rf .chatgpt-readable
+          mkdir .chatgpt-readable
+          cp -a readable/. .chatgpt-readable/
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add .chatgpt-readable
+          if git diff --cached --quiet; then
+            echo 'No readable files to commit.'
+          else
+            git commit -m 'Add ChatGPT-readable research chunks'
+            git push origin HEAD:main
+          fi
 
-      - name: Upload inspection report
+      - name: Upload readable extraction artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: research-inspection-report
-          path: inspection-report.txt
+          name: chatgpt-readable-research
+          path: readable/
           if-no-files-found: warn
+          retention-days: 7
