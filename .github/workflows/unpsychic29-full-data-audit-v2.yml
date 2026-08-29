@@ -1,0 +1,204 @@
+name: UNPSYCHIC29 Full Data Audit V2
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download exact release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="chatgpt-full-data-33258430945"
+          BASE="https://github.com/zahidshaikmohammed-cmyk/dhan_research/releases/download/${TAG}"
+          mkdir -p input data output
+          curl -fL --retry 5 --retry-delay 3 -o input/chatgpt-data-001.zip "$BASE/chatgpt-data-001.zip"
+          curl -fL --retry 5 --retry-delay 3 -o input/chatgpt-data-002.zip "$BASE/chatgpt-data-002.zip"
+          curl -fL --retry 5 --retry-delay 3 -o input/PARQUET_MANIFEST.json "$BASE/PARQUET_MANIFEST.json"
+          curl -fL --retry 5 --retry-delay 3 -o input/lfs-parts.sha256 "$BASE/lfs-parts.sha256"
+          sha256sum input/chatgpt-data-001.zip input/chatgpt-data-002.zip > output/download_sha256.txt
+          unzip -q input/chatgpt-data-001.zip -d data
+          unzip -q input/chatgpt-data-002.zip -d data
+          find data -type f -name '*.csv' | sort > output/csv_inventory.txt
+          echo "CSV_COUNT=$(wc -l < output/csv_inventory.txt)" | tee output/inventory.txt
+          du -sh data | tee -a output/inventory.txt
+
+      - name: Install audit engine
+        run: python -m pip install --disable-pip-version-check --no-input duckdb pandas pyarrow
+
+      - name: Complete data-level audit
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import csv, json, math, os, re, statistics, traceback
+          from pathlib import Path
+          import duckdb
+          import pandas as pd
+
+          ROOT=Path('data'); OUT=Path('output')
+          manifest=json.loads(Path('input/PARQUET_MANIFEST.json').read_text(encoding='utf-8'))
+          files=sorted(ROOT.rglob('*.csv'))
+          expected=manifest.get('files',[])
+          exp_by_source={x['source']:x for x in expected}
+
+          report={'status':'RUNNING','inventory':{},'manifest':{},'files':[],'global':{},'anomalies':[]}
+          report['inventory']={'csv_files':len(files),'non_csv_files':len([p for p in ROOT.rglob('*') if p.is_file() and p.suffix.lower()!='.csv'])}
+          report['manifest']={'total_files':manifest.get('total_files'),'total_rows':manifest.get('total_rows'),'listed_files':len(expected)}
+
+          def csv_source_name(p):
+              n=p.name
+              if n.startswith('daily_features_500.parquet.chunk'):
+                  return 'daily_features_500.parquet'
+              m=re.match(r'raw_1min__(.+)\.parquet\.chunk\d+\.csv$',n)
+              if m: return 'raw_1min/'+m.group(1)+'.parquet'
+              return None
+
+          con=duckdb.connect(database=':memory:')
+          con.execute('PRAGMA threads=2')
+          raw_views=[]; daily_views=[]
+          total_rows=0
+          schema_counts={}
+
+          for i,p in enumerate(files,1):
+              rec={'file':p.relative_to(ROOT).as_posix(),'bytes':p.stat().st_size}
+              try:
+                  with p.open('r',encoding='utf-8-sig',newline='') as f:
+                      h=next(csv.reader(f))
+                  rec['header']=h
+                  v=f'v{i}'
+                  path_sql=str(p).replace("'","''")
+                  con.execute(f"CREATE OR REPLACE VIEW {v} AS SELECT * FROM read_csv_auto('{path_sql}',header=true,strict_mode=true,ignore_errors=false,normalize_names=false)")
+                  d=con.execute(f'DESCRIBE {v}').fetchall()
+                  cols=[{'name':r[0],'type':r[1]} for r in d]
+                  rec['columns']=cols
+                  rec['row_count']=int(con.execute(f'SELECT COUNT(*) FROM {v}').fetchone()[0])
+                  total_rows+=rec['row_count']
+                  sig=json.dumps(cols,sort_keys=True)
+                  schema_counts[sig]=schema_counts.get(sig,0)+1
+                  source=csv_source_name(p); rec['manifest_source']=source
+                  if source is None or source not in exp_by_source:
+                      rec['manifest_match']=False; report['anomalies'].append({'file':rec['file'],'issue':'NO_MANIFEST_MATCH','source':source})
+                  else:
+                      e=exp_by_source[source]; rec['manifest_match']=True; rec['expected_rows']=e['rows']; rec['expected_columns']=e['columns']; rec['expected_chunks']=e.get('chunks')
+                      if rec['row_count']!=e['rows']:
+                          report['anomalies'].append({'file':rec['file'],'issue':'ROW_COUNT_MISMATCH','expected':e['rows'],'actual':rec['row_count']})
+                      if h!=e['columns']:
+                          report['anomalies'].append({'file':rec['file'],'issue':'HEADER_MISMATCH','expected':e['columns'],'actual':h})
+                  rec['null_counts']={}; rec['unique_counts']={}
+                  for r in d:
+                      c,t=r[0],r[1]; q='"'+c.replace('"','""')+'"'
+                      rec['null_counts'][c]=int(con.execute(f'SELECT COUNT(*) FROM {v} WHERE {q} IS NULL').fetchone()[0])
+                      rec['unique_counts'][c]=int(con.execute(f'SELECT COUNT(DISTINCT {q}) FROM {v}').fetchone()[0])
+                  if any(x.startswith('raw_1min__') for x in [p.name]): raw_views.append(v)
+                  else: daily_views.append(v)
+                  report['files'].append(rec)
+              except Exception as e:
+                  rec['error']=str(e); rec['traceback']=traceback.format_exc(); report['files'].append(rec); report['anomalies'].append({'file':rec['file'],'issue':'READ_ERROR','error':str(e)})
+
+          report['global']['total_rows']=total_rows
+          report['global']['files_successfully_read']=sum('error' not in r for r in report['files'])
+          report['global']['files_with_errors']=sum('error' in r for r in report['files'])
+          report['global']['schema_signatures']=[{'file_count':n,'columns':json.loads(s)} for s,n in schema_counts.items()]
+          report['global']['schema_signature_count']=len(schema_counts)
+          report['global']['manifest_file_count_match']=(len(files)==manifest.get('total_files'))
+          report['global']['manifest_row_count_match']=(total_rows==manifest.get('total_rows'))
+
+          def qident(c): return '"'+c.replace('"','""')+'"'
+          raw_expected={'symbol':'VARCHAR','timestamp':'TIMESTAMP WITH TIME ZONE','open':'DOUBLE','high':'DOUBLE','low':'DOUBLE','close':'DOUBLE','volume':'DOUBLE','security_id':'VARCHAR'}
+          if raw_views:
+              union=' UNION ALL '.join(f'SELECT * FROM {v}' for v in raw_views)
+              con.execute(f'CREATE OR REPLACE VIEW raw_all AS {union}')
+              # One global scan family over all 500 raw instruments.
+              report['global']['raw_rows']=int(con.execute('SELECT COUNT(*) FROM raw_all').fetchone()[0])
+              report['global']['raw_symbols']=int(con.execute('SELECT COUNT(DISTINCT symbol) FROM raw_all').fetchone()[0])
+              report['global']['raw_symbol_list']=[r[0] for r in con.execute('SELECT DISTINCT symbol FROM raw_all ORDER BY 1').fetchall()]
+              report['global']['raw_timestamp_min'],report['global']['raw_timestamp_max']=con.execute('SELECT MIN(timestamp),MAX(timestamp) FROM raw_all').fetchone()
+              report['global']['raw_nulls']={c:int(con.execute(f'SELECT COUNT(*) FROM raw_all WHERE {qident(c)} IS NULL').fetchone()[0]) for c in raw_expected}
+              report['global']['raw_stats']={}
+              for c in ['open','high','low','close','volume']:
+                  mn,mx,avg,med=con.execute(f'SELECT MIN({qident(c)}),MAX({qident(c)}),AVG({qident(c)}),MEDIAN({qident(c)}) FROM raw_all').fetchone()
+                  report['global']['raw_stats'][c]={'min':mn,'max':mx,'mean':avg,'median':med}
+              report['global']['raw_invalid_ohlc']=int(con.execute('SELECT COUNT(*) FROM raw_all WHERE high<low OR open<low OR open>high OR close<low OR close>high').fetchone()[0])
+              report['global']['raw_negative_volume']=int(con.execute('SELECT COUNT(*) FROM raw_all WHERE volume<0').fetchone()[0])
+              report['global']['raw_nonpositive_prices']=int(con.execute('SELECT COUNT(*) FROM raw_all WHERE open<=0 OR high<=0 OR low<=0 OR close<=0').fetchone()[0])
+              report['global']['raw_duplicate_records']=int(con.execute('SELECT COUNT(*)-COUNT(DISTINCT md5(concat_ws(chr(31),symbol,CAST(timestamp AS VARCHAR),CAST(open AS VARCHAR),CAST(high AS VARCHAR),CAST(low AS VARCHAR),CAST(close AS VARCHAR),CAST(volume AS VARCHAR),CAST(security_id AS VARCHAR)))) FROM raw_all').fetchone()[0])
+              # Per-symbol timestamp duplicate and ordering checks.
+              dup=con.execute('SELECT symbol, COUNT(*)-COUNT(DISTINCT timestamp) n FROM raw_all GROUP BY symbol HAVING n>0 ORDER BY n DESC').fetchall()
+              report['global']['symbols_with_duplicate_timestamps']=[{'symbol':s,'count':int(n)} for s,n in dup]
+              # Trading-session gap check: within each symbol/date, timestamps should not have gaps > 1 minute during observed runs.
+              gaps=con.execute('''WITH x AS (SELECT symbol,timestamp,LAG(timestamp) OVER(PARTITION BY symbol ORDER BY timestamp) prev FROM raw_all), g AS (SELECT symbol,timestamp,prev,epoch(timestamp-prev)/60.0 gap_min FROM x WHERE prev IS NOT NULL AND timestamp>prev AND epoch(timestamp-prev)>90) SELECT symbol,COUNT(*) n,MAX(gap_min) max_gap_min FROM g GROUP BY symbol ORDER BY n DESC''').fetchall()
+              report['global']['timestamp_gaps_over_90_seconds']=[{'symbol':s,'count':int(n),'max_gap_minutes':float(m)} for s,n,m in gaps]
+              report['global']['raw_out_of_order']=int(con.execute('''WITH x AS (SELECT symbol,timestamp,LAG(timestamp) OVER(PARTITION BY symbol ORDER BY timestamp) prev FROM raw_all) SELECT COUNT(*) FROM x WHERE prev IS NOT NULL AND timestamp<prev''').fetchone()[0])
+              # Exact per-symbol row counts for manifest cross-check.
+              pd.DataFrame(con.execute('SELECT symbol,COUNT(*) rows,MIN(timestamp) first_timestamp,MAX(timestamp) last_timestamp FROM raw_all GROUP BY symbol ORDER BY symbol').fetchall(),columns=['symbol','rows','first_timestamp','last_timestamp']).to_csv(OUT/'raw_symbol_summary.csv',index=False)
+
+              # Per-column quantile profile on the entire 45.8m-row raw dataset.
+              for c in ['open','high','low','close','volume']:
+                  vals=con.execute(f'''SELECT quantile_cont({qident(c)},0.001),quantile_cont({qident(c)},0.01),quantile_cont({qident(c)},0.5),quantile_cont({qident(c)},0.99),quantile_cont({qident(c)},0.999) FROM raw_all''').fetchone()
+                  report['global']['raw_stats'][c].update({'q001':vals[0],'q01':vals[1],'q50':vals[2],'q99':vals[3],'q999':vals[4]})
+
+          if daily_views:
+              con.execute('CREATE OR REPLACE VIEW daily_all AS '+' UNION ALL '.join(f'SELECT * FROM {v}' for v in daily_views))
+              report['global']['daily_rows']=int(con.execute('SELECT COUNT(*) FROM daily_all').fetchone()[0])
+              report['global']['daily_symbols']=int(con.execute('SELECT COUNT(DISTINCT symbol) FROM daily_all').fetchone()[0])
+              report['global']['daily_date_min'],report['global']['daily_date_max']=con.execute('SELECT MIN(trade_date),MAX(trade_date) FROM daily_all').fetchone()
+              report['global']['daily_nulls']={c:int(con.execute(f'SELECT COUNT(*) FROM daily_all WHERE {qident(c)} IS NULL').fetchone()[0]) for c in ['symbol','trade_date','previous_close','open','close','gap_pct','first10_return_pct','first10_range_pct','first10_volume','day_volume','traded_value','day_range_pct','post10_max_up_pct','post10_max_down_pct','first10_direction','close_continuation_after10','reversal_flag','bars','session_coverage_pct','opening10_complete','opening10_missing_bars','batch_number']}
+              report['global']['daily_invalid_ohlc']=int(con.execute('SELECT COUNT(*) FROM daily_all WHERE open<=0 OR close<=0 OR previous_close<=0').fetchone()[0])
+              report['global']['daily_opening10_incomplete']=int(con.execute('SELECT COUNT(*) FROM daily_all WHERE opening10_complete=false').fetchone()[0])
+              report['global']['daily_bad_session_coverage']=int(con.execute('SELECT COUNT(*) FROM daily_all WHERE session_coverage_pct<0 OR session_coverage_pct>100').fetchone()[0])
+              report['global']['daily_bad_bars']=int(con.execute('SELECT COUNT(*) FROM daily_all WHERE bars<0 OR opening10_missing_bars<0').fetchone()[0])
+              report['global']['daily_duplicate_symbol_date']=int(con.execute('SELECT COUNT(*) FROM (SELECT symbol,trade_date,COUNT(*) n FROM daily_all GROUP BY 1,2 HAVING n>1)').fetchone()[0])
+
+          report['status']='COMPLETE' if not report['anomalies'] and report['global']['files_with_errors']==0 and report['global']['manifest_file_count_match'] and report['global']['manifest_row_count_match'] else 'COMPLETE_WITH_ANOMALIES'
+          (OUT/'full_audit_report.json').write_text(json.dumps(report,indent=2,default=str),encoding='utf-8')
+          pd.DataFrame(report['files']).to_csv(OUT/'file_level_audit.csv',index=False)
+          summary=[
+              'UNPSYCHIC29 COMPLETE DATA-LEVEL AUDIT V2','='*64,
+              f"CSV files found: {len(files)}",
+              f"Manifest files: {manifest.get('total_files')}",
+              f"Files successfully read: {report['global']['files_successfully_read']}",
+              f"Files with errors: {report['global']['files_with_errors']}",
+              f"Total rows read: {total_rows:,}",
+              f"Manifest total rows: {manifest.get('total_rows')}",
+              f"Schema signatures: {len(schema_counts)}",
+              f"Manifest file count match: {report['global']['manifest_file_count_match']}",
+              f"Manifest row count match: {report['global']['manifest_row_count_match']}",
+              f"Anomaly count: {len(report['anomalies'])}",
+              f"RAW duplicate records: {report['global'].get('raw_duplicate_records')}",
+              f"RAW duplicate timestamps: {sum(x['count'] for x in report['global'].get('symbols_with_duplicate_timestamps',[]))}",
+              f"RAW OHLC violations: {report['global'].get('raw_invalid_ohlc')}",
+              f"RAW negative volume: {report['global'].get('raw_negative_volume')}",
+              f"RAW nonpositive prices: {report['global'].get('raw_nonpositive_prices')}",
+              f"RAW out-of-order timestamps: {report['global'].get('raw_out_of_order')}",
+              f"RAW symbols: {report['global'].get('raw_symbols')}",
+              f"RAW timestamp range: {report['global'].get('raw_timestamp_min')} -> {report['global'].get('raw_timestamp_max')}",
+              f"DAILY rows: {report['global'].get('daily_rows')}",
+              f"DAILY symbols: {report['global'].get('daily_symbols')}",
+              f"DAILY date range: {report['global'].get('daily_date_min')} -> {report['global'].get('daily_date_max')}",
+              f"FINAL STATUS: {report['status']}",
+          ]
+          (OUT/'AUDIT_SUMMARY.txt').write_text('\n'.join(summary)+'\n',encoding='utf-8')
+          print('\n'.join(summary))
+          if report['status']!='COMPLETE':
+              raise SystemExit('DATA AUDIT FOUND ANOMALIES; see audit artifacts')
+          PY
+
+      - name: Upload audit artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unpsychic29-complete-data-audit-v2
+          path: output/
+          retention-days: 30
