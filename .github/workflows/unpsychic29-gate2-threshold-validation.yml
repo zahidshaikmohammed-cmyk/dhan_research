@@ -1,0 +1,74 @@
+name: UNPSYCHIC29 Gate 2 Threshold Validation
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  actions: read
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download completed Gate 2 artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p input
+          gh run download 33266330446 -n unpsychic29-gate2-research-v4 -D input
+          test -f input/GATE2_session_metrics.parquet
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check -q pandas pyarrow numpy scipy
+      - name: Validate robust Gate 2 envelope
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import pandas as pd,numpy as np,json
+          from scipy.stats import spearmanr
+          out=Path('output');out.mkdir(exist_ok=True)
+          s=pd.read_parquet('input/GATE2_session_metrics.parquet')
+          s['trade_date']=pd.to_datetime(s.trade_date)
+          split=s.trade_date.sort_values().iloc[len(s.trade_date)//2]
+          s['period']=np.where(s.trade_date<=split,'P1','P2')
+          def mad(x): return (x-x.median()).abs().median()
+          def aggregate(x):
+            g=x.groupby('symbol')
+            d=g.agg(valid_sessions=('trade_date','count'),range10_pct_median=('range10_pct','median'),eff10_median=('eff10','median'),opening_flat_rate_005=('ret10_pct',lambda z:(z.abs()<.05).mean()),continuation_rate=('continuation_same_direction','mean'),late_move_ge_010_rate=('move25_30_ge_010','mean'))
+            d['opening_chaos_rate_eff50']=g['eff10'].apply(lambda z:(z<.50).mean())
+            d['late_directional_rate']=g.apply(lambda z:((z.ret25_30_pct.abs()>=.10)&(z.eff10>=.50)).mean())
+            return d.reset_index()
+          full=aggregate(s); p1=aggregate(s[s.period=='P1']); p2=aggregate(s[s.period=='P2'])
+          def thresholds(d,kr=1.5,ke=1.0,kl=1.0,kf=1.5):
+            return {'range10_max':float(d.range10_pct_median.median()+kr*mad(d.range10_pct_median)),'eff10_min':float(d.eff10_median.median()+ke*mad(d.eff10_median)),'late_directional_min':float(d.late_directional_rate.median()+kl*mad(d.late_directional_rate)),'flat_rate_max':float(d.opening_flat_rate_005.median()+kf*mad(d.opening_flat_rate_005))}
+          def apply(d,t): return d[(d.range10_pct_median<=t['range10_max'])&(d.eff10_median>=t['eff10_min'])&(d.late_directional_rate>=t['late_directional_min'])&(d.opening_flat_rate_005<=t['flat_rate_max'])].copy()
+          # Evaluate a compact grid of robust-MAD envelopes; no target count is used.
+          grid=[]
+          for kr in [.5,1,1.5,2]:
+            for ke in [.5,1,1.5,2]:
+              for kl in [.5,1,1.5,2]:
+                for kf in [1,1.5,2]:
+                  t=thresholds(full,kr,ke,kl,kf); a=apply(p1,t); b=apply(p2,t)
+                  inter=len(set(a.symbol)&set(b.symbol)); union=len(set(a.symbol)|set(b.symbol)); j=inter/union if union else 0
+                  if len(a)>=10 and len(b)>=10: grid.append({'kr':kr,'ke':ke,'kl':kl,'kf':kf,'p1_n':len(a),'p2_n':len(b),'intersection':inter,'jaccard':j,'p1_ld_median':float(a.late_directional_rate.median()) if len(a) else np.nan,'p2_ld_median':float(b.late_directional_rate.median()) if len(b) else np.nan})
+          gd=pd.DataFrame(grid).sort_values(['jaccard','intersection','p1_n'],ascending=False);gd.to_csv(out/'GATE2_threshold_grid.csv',index=False)
+          # Primary envelope: robust central-but-useful regime, selected for temporal stability, not target size.
+          primary=thresholds(full,1.5,1,1,1.5); full_sel=apply(full,primary); p1_sel=apply(p1,primary); p2_sel=apply(p2,primary)
+          overlap=len(set(p1_sel.symbol)&set(p2_sel.symbol)); union=len(set(p1_sel.symbol)|set(p2_sel.symbol));
+          # Train on P1, apply its thresholds to P2: genuine temporal holdout.
+          train_t=thresholds(p1,1.5,1,1,1.5); holdout=apply(p2,train_t)
+          # Directional consistency and rank stability across periods.
+          merged=p1.merge(p2,on='symbol',suffixes=('_p1','_p2')); rho=float(spearmanr(merged.late_directional_rate_p1,merged.late_directional_rate_p2).statistic)
+          report={'method':'robust median/MAD envelope with temporal holdout','split_date':str(split.date()),'primary_thresholds':primary,'full_survivors':int(len(full_sel)),'p1_survivors':int(len(p1_sel)),'p2_survivors':int(len(p2_sel)),'p1_p2_intersection':int(overlap),'p1_p2_jaccard':float(overlap/union if union else 0),'holdout_thresholds_learned_on_P1':train_t,'holdout_P2_survivors':int(len(holdout)),'period_rank_spearman_late_directional':rho,'grid_candidates_considered':len(gd),'grid_best_jaccard':float(gd.iloc[0].jaccard) if len(gd) else None}
+          Path(out/'GATE2_THRESHOLD_VALIDATION.json').write_text(json.dumps(report,indent=2,default=str))
+          full_sel.to_csv(out/'GATE2_PRIMARY_SURVIVORS.csv',index=False); holdout.to_csv(out/'GATE2_HOLDOUT_SURVIVORS.csv',index=False)
+          print(json.dumps(report,indent=2)); print(full_sel[['symbol','range10_pct_median','eff10_median','late_directional_rate','continuation_rate','opening_flat_rate_005']].sort_values('late_directional_rate',ascending=False).to_string(index=False))
+          PY
+      - name: Upload threshold validation
+        uses: actions/upload-artifact@v4
+        with:
+          name: unpsychic29-gate2-threshold-validation
+          path: output/
+          retention-days: 30
