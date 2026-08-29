@@ -1,0 +1,43 @@
+UNPSYCHIC29 GATE 1 — COMPLETE EMPIRICAL GAP ANALYSIS
+Source rows: 122262
+Rows with invalid trade_date: 0
+Rows with invalid gap_pct: 485
+Rows retained for stock analysis: 121777
+Stocks: 500
+Independent gap formula mismatches >1e-9 percentage points: 116461
+
+No arbitrary survivor percentage was applied.
+Gate 1 evidence files: UNPSYCHIC29_GATE1_500_STOCKS.csv and UNPSYCHIC29_GATE1_DISTRIBUTION.csv
+
+Selected quietest 30 (diagnostic only):
+ gap_rank     symbol  median_abs_gap_pct  p90_abs_gap_pct  p95_abs_gap_pct  gap_up_1_rate  gap_down_1_rate  large_gap_1_rate
+        1 CASTROLIND            0.001768         0.005861         0.008365            0.0              0.0               0.0
+        2 HINDUNILVR            0.002312         0.008015         0.012016            0.0              0.0               0.0
+        3      IRCTC            0.002108         0.008011         0.012516            0.0              0.0               0.0
+        4        ITC            0.001921         0.007038         0.012878            0.0              0.0               0.0
+        5  COALINDIA            0.002213         0.007783         0.012877            0.0              0.0               0.0
+        6     COLPAL            0.002229         0.009046         0.012038            0.0              0.0               0.0
+        7        ACC            0.002320         0.009191         0.012054            0.0              0.0               0.0
+        8      CIPLA            0.002533         0.009080         0.011897            0.0              0.0               0.0
+        9      GLAXO            0.002652         0.009235         0.011677            0.0              0.0               0.0
+       10        ABB            0.002528         0.008883         0.012869            0.0              0.0               0.0
+       11  TATAPOWER            0.001906         0.007788         0.014121            0.0              0.0               0.0
+       12        HAL            0.002330         0.009512         0.012283            0.0              0.0               0.0
+       13       NTPC            0.002298         0.008798         0.013944            0.0              0.0               0.0
+       14  NESTLEIND            0.002900         0.008402         0.012107            0.0              0.0               0.0
+       15   DIVISLAB            0.002915         0.009019         0.011375            0.0              0.0               0.0
+       16      ARE&M            0.002697         0.008999         0.013557            0.0              0.0               0.0
+       17       NHPC            0.002541         0.009212         0.013741            0.0              0.0               0.0
+       18 TORNTPOWER            0.002859         0.008794         0.013050            0.0              0.0               0.0
+       19      DABUR            0.002673         0.009145         0.013919            0.0              0.0               0.0
+       20  SUNPHARMA            0.002839         0.009514         0.012878            0.0              0.0               0.0
+       21      DMART            0.002662         0.010158         0.012334            0.0              0.0               0.0
+       22  ZYDUSLIFE            0.002959         0.009244         0.012397            0.0              0.0               0.0
+       23 SUPREMEIND            0.002857         0.009786         0.012453            0.0              0.0               0.0
+       24     FORTIS            0.003109         0.009043         0.011632            0.0              0.0               0.0
+       25     MARICO            0.002837         0.009595         0.013365            0.0              0.0               0.0
+       26   BOSCHLTD            0.002846         0.009732         0.013352            0.0              0.0               0.0
+       27  BRITANNIA            0.002277         0.008785         0.015258            0.0              0.0               0.0
+       28     GRASIM            0.003155         0.008538         0.012308            0.0              0.0               0.0
+       29   GLENMARK            0.003041         0.009822         0.011663            0.0              0.0               0.0
+       30  LICHSGFIN            0.002529         0.009913         0.014173            0.0              0.0               0.0
