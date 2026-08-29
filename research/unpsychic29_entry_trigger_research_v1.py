@@ -34,7 +34,10 @@ def metric(x,side):
 
 for sym,g0 in E.groupby('symbol'):
   for ent,g in g0.groupby('entry'):
-    tr=g[g.split=='TRAIN']; va=g[g.split=='VALIDATION']; te=g[g.split=='TEST']
+    # 'split' is a real column in ENTRY_EVENT_DATA; use bracket access because
+    # DataFrame.split resolves to the Python/DataFrame method namespace rather
+    # than the column on some pandas versions.
+    tr=g[g['split']=='TRAIN']; va=g[g['split']=='VALIDATION']; te=g[g['split']=='TEST']
     if len(tr)<80 or len(va)<30 or len(te)<30: continue
     for side in SIDES:
       # Direction gate is deliberately fixed to the observed 10m direction.
@@ -54,7 +57,7 @@ for sym,g0 in E.groupby('symbol'):
           a_specs=[(f'Q{q}',float(np.quantile(vals,q))) for q in (.60,.70,.80,.90)]
         valsb=dtr[b].dropna()
         if len(valsb)<40: continue
-        b_specs=[(f'Q{q}',float(np.quantile(valsb,q))) for q in (.60,.70,.80)]
+        b_specs=[(f'Q{q}',float(np.quantile(np.abs(valsb.to_numpy(float)),q))) for q in (.60,.70,.80)]
         for aname,ath in a_specs:
           for bname,bth in b_specs:
             def filt(d):
@@ -63,7 +66,8 @@ for sym,g0 in E.groupby('symbol'):
                 x=x[x[a]==(1 if side=='LONG' else -1)]
               else:
                 x=x[np.abs(x[a])>=ath]
-              # For efficiency/R2 require high magnitude; momentum is side-consistent below.
+              # For efficiency/R2 require high magnitude; momentum is already
+              # direction-gated by dtr/dva/dte above.
               x=x[np.abs(x[b])>=bth]
               return x
             A=filt(dva); T=filt(dte)
@@ -99,7 +103,7 @@ protocol={
  'validation_selection':'One candidate per stock/side is selected on VALIDATION; TEST is never used for selection.',
  'minimum_samples':'Validation >=20 and test >=20 for candidate reporting; OOS survivor table additionally requires test >=30.',
  'entry_definition':'Signal is valid at the close of the simulated 1-minute entry bar. This layer does not assume a future price.',
- 'execution_price':'Signal-bar close is the research reference price only; actual next-tick/next-open slippage is deferred to the execution simulator.',
+ 'execution_price':'Signal-bar close is the research reference price only; actual next-tick/next-open slippage must be tested separately.',
  'stop_target':'Explicitly excluded from this phase.',
  'no_trade':'If the direction gate, trigger gate, or trend-quality gate is absent, no entry permission is granted.'
 }
