@@ -1,0 +1,198 @@
+name: UNPSYCHIC29 Gate 2 Empirical Research
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  gate2:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download complete export
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG=chatgpt-full-data-33258430945
+          BASE=https://github.com/zahidshaikmohammed-cmyk/dhan_research/releases/download/$TAG
+          mkdir -p input data output
+          curl -fL --retry 5 --retry-delay 2 -o input/001.zip $BASE/chatgpt-data-001.zip
+          curl -fL --retry 5 --retry-delay 2 -o input/002.zip $BASE/chatgpt-data-002.zip
+          unzip -q input/001.zip -d data
+          unzip -q input/002.zip -d data
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check -q pandas pyarrow duckdb numpy
+      - name: Compute Gate 2 from every raw 1-minute session
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import duckdb, pandas as pd, numpy as np, json, math, re, traceback
+
+          root=Path('data'); out=Path('output'); out.mkdir(exist_ok=True)
+          files=sorted(root.rglob('raw_1min/*.parquet'))
+          assert len(files)==500, f'Expected 500 raw parquet files, found {len(files)}'
+
+          con=duckdb.connect(); con.execute('PRAGMA threads=4')
+          rows=[]; errors=[]; inventory=[]
+
+          # The raw bars are treated as 1-minute bars. Session windows use bar timestamps:
+          # 09:15-09:20 = five bars, 09:15-09:25 = ten bars, 09:15-09:30 = fifteen bars.
+          # No arbitrary stock ranking or fixed survivor percentage is applied here.
+          for i,p in enumerate(files,1):
+              symbol=p.stem
+              rel=str(p).replace("'","''")
+              try:
+                  desc=con.execute(f"DESCRIBE SELECT * FROM read_parquet('{rel}')").fetchall()
+                  cols=[x[0] for x in desc]
+                  lower={c.lower():c for c in cols}
+                  required_aliases={
+                      'timestamp':['timestamp','datetime','date_time','time'],
+                      'open':['open'], 'high':['high'], 'low':['low'], 'close':['close']
+                  }
+                  chosen={}
+                  for k,alts in required_aliases.items():
+                      for a in alts:
+                          if a in lower: chosen[k]=lower[a]; break
+                  if len(chosen)<5:
+                      raise ValueError(f'missing required OHLC/timestamp columns: {cols}')
+                  ts=chosen['timestamp']; op=chosen['open']; hi=chosen['high']; lo=chosen['low']; cl=chosen['close']
+                  qts='"'+ts.replace('"','""')+'"'; qop='"'+op.replace('"','""')+'"'; qhi='"'+hi.replace('"','""')+'"'; qlo='"'+lo.replace('"','""')+'"'; qcl='"'+cl.replace('"','""')+'"'
+
+                  # Keep the transformation explicit so timestamp interpretation is auditable.
+                  sql=f"""
+                  WITH base AS (
+                    SELECT CAST({qts} AS TIMESTAMP) AS ts,
+                           CAST({qop} AS DOUBLE) AS o, CAST({qhi} AS DOUBLE) AS h,
+                           CAST({qlo} AS DOUBLE) AS l, CAST({qcl} AS DOUBLE) AS c
+                    FROM read_parquet('{rel}')
+                  ), b AS (
+                    SELECT *, CAST(ts AS DATE) AS trade_date,
+                           EXTRACT(HOUR FROM ts) AS hh, EXTRACT(MINUTE FROM ts) AS mm,
+                           LAG(c) OVER (PARTITION BY CAST(ts AS DATE) ORDER BY ts) AS prev_c
+                    FROM base
+                    WHERE CAST(ts AS TIME) >= TIME '09:15:00' AND CAST(ts AS TIME) < TIME '09:31:00'
+                  ), s AS (
+                    SELECT trade_date,
+                      COUNT(*) FILTER (WHERE CAST(ts AS TIME) >= TIME '09:15:00' AND CAST(ts AS TIME) < TIME '09:30:00') AS n15,
+                      COUNT(*) FILTER (WHERE CAST(ts AS TIME) >= TIME '09:15:00' AND CAST(ts AS TIME) < TIME '09:20:00') AS n5,
+                      COUNT(*) FILTER (WHERE CAST(ts AS TIME) >= TIME '09:20:00' AND CAST(ts AS TIME) < TIME '09:25:00') AS n20_25,
+                      COUNT(*) FILTER (WHERE CAST(ts AS TIME) >= TIME '09:25:00' AND CAST(ts AS TIME) < TIME '09:30:00') AS n25_30,
+                      MIN(o) FILTER (WHERE CAST(ts AS TIME) >= TIME '09:15:00' AND CAST(ts AS TIME) < TIME '09:25:00') AS open15,
+                      MAX(h) FILTER (WHERE CAST(ts AS TIME) >= TIME '09:15:00' AND CAST(ts AS TIME) < TIME '09:20:00') AS hi5,
+                      MIN(l) FILTER (WHERE CAST(ts AS TIME) >= TIME '09:15:00' AND CAST(ts AS TIME) < TIME '09:20:00') AS lo5,
+                      MAX(h) FILTER (WHERE CAST(ts AS TIME) >= TIME '09:15:00' AND CAST(ts AS TIME) < TIME '09:25:00') AS hi10,
+                      MIN(l) FILTER (WHERE CAST(ts AS TIME) >= TIME '09:15:00' AND CAST(ts AS TIME) < TIME '09:25:00') AS lo10,
+                      MAX(h) FILTER (WHERE CAST(ts AS TIME) >= TIME '09:15:00' AND CAST(ts AS TIME) < TIME '09:30:00') AS hi15,
+                      MIN(l) FILTER (WHERE CAST(ts AS TIME) >= TIME '09:15:00' AND CAST(ts AS TIME) < TIME '09:30:00') AS lo15,
+                      FIRST(o ORDER BY ts) FILTER (WHERE CAST(ts AS TIME) >= TIME '09:15:00' AND CAST(ts AS TIME) < TIME '09:16:00') AS first_open,
+                      FIRST(c ORDER BY ts DESC) FILTER (WHERE CAST(ts AS TIME) >= TIME '09:15:00' AND CAST(ts AS TIME) < TIME '09:20:00') AS c20,
+                      FIRST(c ORDER BY ts DESC) FILTER (WHERE CAST(ts AS TIME) >= TIME '09:20:00' AND CAST(ts AS TIME) < TIME '09:25:00') AS c25,
+                      FIRST(c ORDER BY ts DESC) FILTER (WHERE CAST(ts AS TIME) >= TIME '09:25:00' AND CAST(ts AS TIME) < TIME '09:30:00') AS c30,
+                      FIRST(c ORDER BY ts DESC) FILTER (WHERE CAST(ts AS TIME) >= TIME '09:30:00' AND CAST(ts AS TIME) < TIME '09:31:00') AS c31,
+                      SUM(ABS(c/NULLIF(prev_c,0)-1.0)) FILTER (WHERE CAST(ts AS TIME) >= TIME '09:15:00' AND CAST(ts AS TIME) < TIME '09:20:00') AS path5,
+                      SUM(ABS(c/NULLIF(prev_c,0)-1.0)) FILTER (WHERE CAST(ts AS TIME) >= TIME '09:15:00' AND CAST(ts AS TIME) < TIME '09:25:00') AS path10,
+                      SUM(ABS(c/NULLIF(prev_c,0)-1.0)) FILTER (WHERE CAST(ts AS TIME) >= TIME '09:15:00' AND CAST(ts AS TIME) < TIME '09:30:00') AS path15,
+                      SUM(CASE WHEN c>o THEN 1 WHEN c<o THEN -1 ELSE 0 END) FILTER (WHERE CAST(ts AS TIME) >= TIME '09:15:00' AND CAST(ts AS TIME) < TIME '09:20:00') AS signed_bars5,
+                      SUM(CASE WHEN c>o THEN 1 WHEN c<o THEN -1 ELSE 0 END) FILTER (WHERE CAST(ts AS TIME) >= TIME '09:15:00' AND CAST(ts AS TIME) < TIME '09:25:00') AS signed_bars10,
+                      SUM(CASE WHEN c>o THEN 1 WHEN c<o THEN -1 ELSE 0 END) FILTER (WHERE CAST(ts AS TIME) >= TIME '09:15:00' AND CAST(ts AS TIME) < TIME '09:30:00') AS signed_bars15,
+                      SUM(CASE WHEN c>o THEN 1 WHEN c<o THEN -1 ELSE 0 END) FILTER (WHERE CAST(ts AS TIME) >= TIME '09:25:00' AND CAST(ts AS TIME) < TIME '09:30:00') AS signed_bars25_30
+                    FROM b GROUP BY trade_date
+                  ), ret AS (
+                    SELECT *,
+                      100.0*(hi5-lo5)/NULLIF(first_open,0) AS range5_pct,
+                      100.0*(hi10-lo10)/NULLIF(first_open,0) AS range10_pct,
+                      100.0*(hi15-lo15)/NULLIF(first_open,0) AS range15_pct,
+                      100.0*(c20/NULLIF(first_open,0)-1.0) AS ret5_pct,
+                      100.0*(c25/NULLIF(first_open,0)-1.0) AS ret10_pct,
+                      100.0*(c30/NULLIF(first_open,0)-1.0) AS ret15_pct,
+                      100.0*(c25/NULLIF(c20,0)-1.0) AS ret20_25_pct,
+                      100.0*(c30/NULLIF(c25,0)-1.0) AS ret25_30_pct,
+                      100.0*(c31/NULLIF(c30,0)-1.0) AS ret30_31_pct,
+                      100.0*path5 AS path5_pct,
+                      100.0*path10 AS path10_pct,
+                      100.0*path15 AS path15_pct
+                    FROM s
+                  )
+                  SELECT *,
+                    ABS(ret5_pct)/NULLIF(path5_pct,0) AS eff5,
+                    ABS(ret10_pct)/NULLIF(path10_pct,0) AS eff10,
+                    ABS(ret15_pct)/NULLIF(path15_pct,0) AS eff15,
+                    ABS(ret25_30_pct)/NULLIF(path15_pct,0) AS late_move_vs_path,
+                    CASE WHEN ret10_pct*ret25_30_pct>0 THEN 1 ELSE 0 END AS continuation_same_direction,
+                    CASE WHEN ABS(ret25_30_pct)>=0.05 THEN 1 ELSE 0 END AS move25_30_ge_005,
+                    CASE WHEN ABS(ret25_30_pct)>=0.10 THEN 1 ELSE 0 END AS move25_30_ge_010,
+                    CASE WHEN ABS(ret25_30_pct)>=0.15 THEN 1 ELSE 0 END AS move25_30_ge_015,
+                    CASE WHEN ABS(ret25_30_pct)>=0.25 THEN 1 ELSE 0 END AS move25_30_ge_025
+                  FROM ret
+                  WHERE n15=15 AND n5=5 AND n20_25=5 AND n25_30=5
+                  """
+                  sess=con.execute(sql).df()
+                  if sess.empty:
+                      inventory.append({'symbol':symbol,'valid_sessions':0,'rows_in_entry_window':0})
+                      continue
+                  sess.insert(0,'symbol',symbol)
+                  rows.append(sess)
+                  inventory.append({'symbol':symbol,'valid_sessions':int(len(sess)),'rows_in_entry_window':int(sess['n15'].sum())})
+              except Exception as e:
+                  errors.append({'symbol':symbol,'file':str(p),'error':str(e),'traceback':traceback.format_exc()})
+              if i%25==0: print(f'PROCESSED {i}/{len(files)}')
+
+          if errors:
+              Path(out/'GATE2_errors.json').write_text(json.dumps(errors,indent=2))
+              raise SystemExit(f'{len(errors)} raw parquet files failed')
+
+          all_sessions=pd.concat(rows,ignore_index=True)
+          all_sessions.to_parquet(out/'GATE2_session_metrics.parquet',index=False)
+
+          # Stock-level empirical distributions. All valid sessions are used; no sampling.
+          metric_cols=['range5_pct','range10_pct','range15_pct','ret5_pct','ret10_pct','ret15_pct','ret20_25_pct','ret25_30_pct','path5_pct','path10_pct','path15_pct','eff5','eff10','eff15','late_move_vs_path','signed_bars5','signed_bars10','signed_bars15','signed_bars25_30']
+          agg={}
+          for c in metric_cols:
+              agg[c+'_median']=(c,'median'); agg[c+'_p25']=(c,lambda x:x.quantile(.25)); agg[c+'_p75']=(c,lambda x:x.quantile(.75)); agg[c+'_p90']=(c,lambda x:x.quantile(.90)); agg[c+'_p95']=(c,lambda x:x.quantile(.95))
+          stock=all_sessions.groupby('symbol').agg(valid_sessions=('trade_date','count'),**agg).reset_index()
+          for t in ['005','010','015','025']:
+              stock['late_move_ge_'+t+'_rate']=all_sessions.groupby('symbol')['move25_30_ge_'+t].mean().values
+          stock['continuation_rate']=all_sessions.groupby('symbol')['continuation_same_direction'].mean().values
+          stock['opening_up_rate']=all_sessions.groupby('symbol').apply(lambda g:(g.ret10_pct>0).mean(),include_groups=False).values
+          stock['late_same_direction_rate']=all_sessions.groupby('symbol').apply(lambda g:((g.ret10_pct*g.ret25_30_pct)>0).mean(),include_groups=False).values
+          stock['opening_flat_rate_005']=all_sessions.groupby('symbol').apply(lambda g:(g.ret10_pct.abs()<0.05).mean(),include_groups=False).values
+          stock['opening_chaos_rate_eff30']=all_sessions.groupby('symbol').apply(lambda g:(g.eff10<0.30).mean(),include_groups=False).values
+          stock['opening_chaos_rate_eff50']=all_sessions.groupby('symbol').apply(lambda g:(g.eff10<0.50).mean(),include_groups=False).values
+          stock['late_directional_rate']=all_sessions.groupby('symbol').apply(lambda g:((g.ret25_30_pct.abs()>=0.10)&(g.eff10>=0.50)).mean(),include_groups=False).values
+          stock=stock.sort_values(['late_directional_rate','continuation_rate','eff10_median','range10_pct_median'],ascending=[False,False,False,True]).reset_index(drop=True)
+          stock.insert(0,'gate2_research_rank',np.arange(1,len(stock)+1))
+          stock.to_csv(out/'UNPSYCHIC29_GATE2_ALL_500.csv',index=False)
+
+          # Population quantiles expose the empirical landscape; these are NOT automatic gates.
+          qrows=[]
+          pop_metrics=['range5_pct_median','range10_pct_median','range15_pct_median','path10_pct_median','eff10_median','continuation_rate','late_move_ge_005_rate','late_move_ge_010_rate','late_move_ge_015_rate','late_move_ge_025_rate','late_directional_rate','opening_flat_rate_005','opening_chaos_rate_eff30','opening_chaos_rate_eff50']
+          for c in pop_metrics:
+              s=stock[c].dropna()
+              for q in [0.05,0.10,0.25,0.50,0.75,0.90,0.95]: qrows.append({'metric':c,'quantile':q,'value':float(s.quantile(q))})
+          pd.DataFrame(qrows).to_csv(out/'GATE2_population_quantiles.csv',index=False)
+
+          # Session-count/data-quality diagnostics.
+          inv=pd.DataFrame(inventory).sort_values('symbol'); inv.to_csv(out/'GATE2_inventory.csv',index=False)
+          checks={
+            'raw_parquet_files':len(files),'symbols':int(all_sessions.symbol.nunique()),'valid_session_rows':int(len(all_sessions)),
+            'session_date_min':str(all_sessions.trade_date.min()),'session_date_max':str(all_sessions.trade_date.max()),
+            'median_sessions_per_stock':float(stock.valid_sessions.median()),'min_sessions_per_stock':int(stock.valid_sessions.min()),'max_sessions_per_stock':int(stock.valid_sessions.max()),
+            'stocks_with_ge_200_sessions':int((stock.valid_sessions>=200).sum()),
+            'stocks_with_ge_230_sessions':int((stock.valid_sessions>=230).sum()),
+            'expected_bars_per_valid_session':15,
+            'method_note':'Gate 2 is descriptive research only. No percentile is declared a gate and no final stock count is targeted.'
+          }
+          Path(out/'GATE2_integrity.json').write_text(json.dumps(checks,indent=2))
+          print(json.dumps(checks,indent=2))
+          print('\nTOP 40 BY LATE DIRECTIONAL RATE')
+          print(stock[['gate2_research_rank','symbol','valid_sessions','range10_pct_median','path10_pct_median','eff10_median','continuation_rate','late_move_ge_010_rate','late_directional_rate','opening_chaos_rate_eff50']].head(40).to_string(index=False))
+          PY
+      - name: Upload Gate 2 research results
+        uses: actions/upload-artifact@v4
+        with:
+          name: unpsychic29-gate2-research
+          path: output/
+          retention-days: 30
