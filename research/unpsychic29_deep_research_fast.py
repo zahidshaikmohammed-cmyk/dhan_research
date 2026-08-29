@@ -67,7 +67,7 @@ for sym in SYMS:
                 if j<len(z):
                     f[f'fwd_{h}']=100*(float(z.cl.iloc[j])/p-1); f[f'fwd_high_{h}']=100*(float(z.h.iloc[ei+1:j+1].max())/p-1); f[f'fwd_low_{h}']=100*(float(z.l.iloc[ei+1:j+1].min())/p-1)
                 else: f[f'fwd_{h}']=np.nan; f[f'fwd_high_{h}']=np.nan; f[f'fwd_low_{h}']=np.nan
-            j=min(len(z)-1,ei+300); f['fwd_close']=100*(float(z.cl.iloc[j])/p-1)
+            f['fwd_close']=100*(float(z.cl.iloc[-1])/p-1)
             events.append(f)
     integrity.append({'symbol':sym,'sessions_used':len(used),'first_session':str(min(used)) if used else None,'last_session':str(max(used)) if used else None,'raw_rows':len(d),'timestamp_min':str(d.ts.min()),'timestamp_max':str(d.ts.max())})
     print(sym,len(used),flush=True)
@@ -75,7 +75,6 @@ for sym in SYMS:
 E=pd.DataFrame(events); E.to_parquet(OUT/'ENTRY_EVENT_DATA.parquet',index=False); pd.DataFrame(integrity).to_csv(OUT/'DATA_COVERAGE_29.csv',index=False)
 dates=np.array(sorted(pd.to_datetime(E.trade_date).unique())); cut1=dates[int(len(dates)*.60)]; cut2=dates[int(len(dates)*.80)]; E['split']=np.where(pd.to_datetime(E.trade_date)<cut1,'TRAIN',np.where(pd.to_datetime(E.trade_date)<cut2,'VALIDATION','TEST'))
 
-# Raw entry-time sweep. This is descriptive, not a fitted model.
 sweep=[]
 for ent,g in E.groupby('entry'):
     for feat in ['mom_3','mom_5','mom_10','mom_15','mom_20','mom_30','eff_5','eff_10','eff_20','r2_10','r2_20','slope_10','slope_20','relvol_5_20','dist_vwap_pct']:
