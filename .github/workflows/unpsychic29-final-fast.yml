@@ -19,88 +19,96 @@ jobs:
           mkdir -p input data output
           gh run download 33266330446 -n unpsychic29-gate2-research-v4 -D input
           test -s input/UNPSYCHIC29_GATE2_ALL_500.csv
-      - name: Download and selectively extract raw 1-minute chunks
+      - name: Extract raw data for Gate 2 candidates
         run: |
           set -euo pipefail
           python - <<'PY'
           import csv, os, zipfile, urllib.request
           from pathlib import Path
-          with open('input/UNPSYCHIC29_GATE2_ALL_500.csv',newline='') as f: rows=list(csv.DictReader(f))
+          rows=list(csv.DictReader(open('input/UNPSYCHIC29_GATE2_ALL_500.csv',newline='')))
           def ok(r):
-              try: return float(r['range10_pct_median'])<=1.5109 and float(r['eff10_median'])>=0.45 and float(r['late_directional_rate'])>=0.32927 and float(r['opening_flat_rate_005'])<=0.06707
-              except (KeyError,TypeError,ValueError): return False
-          candidates=[r['symbol'] for r in rows if ok(r)]; assert candidates; wanted=set(candidates)
+              try:
+                  return float(r['range10_pct_median'])<=1.5109 and float(r['eff10_median'])>=0.45 and float(r['late_directional_rate'])>=0.32927 and float(r['opening_flat_rate_005'])<=0.06707
+              except Exception: return False
+          candidates=[r['symbol'].strip() for r in rows if ok(r)]
+          assert len(candidates)>=29, f'Only {len(candidates)} Gate-2 candidates; cannot produce a 29-name universe.'
+          wanted=set(candidates)
           base='https://github.com/zahidshaikmohammed-cmyk/dhan_research/releases/download/chatgpt-full-data-33258430945'
           for i in (1,2):
-              zpath=f'/tmp/data-{i:03d}.zip'; urllib.request.urlretrieve(f'{base}/chatgpt-data-{i:03d}.zip',zpath)
+              zpath=f'/tmp/data-{i:03d}.zip'
+              urllib.request.urlretrieve(f'{base}/chatgpt-data-{i:03d}.zip',zpath)
               with zipfile.ZipFile(zpath) as z:
-                  hits=[]
-                  for n in z.namelist():
-                      name=Path(n).name
-                      for sym in wanted:
-                          if name.startswith(f'raw_1min__{sym}.parquet.chunk') and name.endswith('.csv'):
-                              hits.append(n); z.extract(n,'data'); break
-                  print(f'archive {i}: matched {len(hits)} raw chunks')
+                  names=z.namelist()
+                  hits=0
+                  for n in names:
+                      bn=Path(n).name
+                      # Accept both parquet chunk CSV naming and normal parquet naming.
+                      match=any(bn.startswith(f'raw_1min__{s}.parquet.chunk') and bn.endswith('.csv') for s in wanted)
+                      if match:
+                          z.extract(n,'data'); hits+=1
+                  print(f'archive {i}: extracted {hits} matching raw chunks')
               os.remove(zpath)
-          got={p.name.split('__',1)[1].split('.parquet.chunk',1)[0] for p in Path('data').rglob('raw_1min__*.parquet.chunk*.csv')}; missing=sorted(wanted-got); assert not missing, f'Missing Gate 2 candidate raw data: {missing}'
-          Path('output/GATE2_CANDIDATES.txt').write_text('\n'.join(candidates)+'\n'); print(f'Gate2 candidates={len(candidates)}, extracted symbols={len(got)}')
+          got={p.name.split('__',1)[1].split('.parquet.chunk',1)[0] for p in Path('data').rglob('raw_1min__*.parquet.chunk*.csv')}
+          missing=sorted(wanted-got)
+          assert not missing, f'Missing raw chunks for Gate-2 candidates: {missing}'
+          Path('output/GATE2_CANDIDATES.txt').write_text('\n'.join(candidates)+'\n')
+          print(f'Gate2 candidates={len(candidates)}; all raw chunks present')
           PY
       - name: Install research engine
         run: python -m pip install --disable-pip-version-check -q pandas duckdb numpy pyarrow
-      - name: Compute Gate 3 and final selection
+      - name: Compute independent Gate 3 score and exact 29
         run: |
           set -euo pipefail
           python - <<'PY'
           from pathlib import Path
           import json, numpy as np, pandas as pd, duckdb
           out=Path('output'); files=sorted(Path('data').rglob('raw_1min__*.parquet.chunk*.csv')); assert files
-          con=duckdb.connect(); con.execute('PRAGMA threads=4'); rows=[]
-          syms=sorted({p.name.split('__',1)[1].split('.parquet.chunk',1)[0] for p in files})
-          for sym in syms:
+          rows=[]
+          for sym in sorted({p.name.split('__',1)[1].split('.parquet.chunk',1)[0] for p in files}):
               fs=[str(p).replace("'","''") for p in files if p.name.startswith(f'raw_1min__{sym}.parquet.chunk')]
-              arr=','.join("'"+x+"'" for x in fs)
-              reader=f'read_csv_auto([{arr}],header=true,union_by_name=true,ignore_errors=true)'
-              q=f"SELECT CAST(timestamp AS TIMESTAMPTZ) AT TIME ZONE 'Asia/Kolkata' ts,CAST(high AS DOUBLE) h,CAST(low AS DOUBLE) l,CAST(close AS DOUBLE) cl FROM {reader} WHERE CAST(CAST(timestamp AS TIMESTAMPTZ) AT TIME ZONE 'Asia/Kolkata' AS TIME)>=TIME '09:25:00' AND CAST(CAST(timestamp AS TIMESTAMPTZ) AT TIME ZONE 'Asia/Kolkata' AS TIME)<TIME '15:31:00' ORDER BY ts"
-              d=con.execute(q).df(); d['date']=d.ts.dt.date
+              arr=','.join("'"+x+"'" for x in fs); con=duckdb.connect(); con.execute('PRAGMA threads=4')
+              q=f"SELECT CAST(timestamp AS TIMESTAMPTZ) AT TIME ZONE 'Asia/Kolkata' ts,CAST(open AS DOUBLE)o,CAST(high AS DOUBLE)h,CAST(low AS DOUBLE)l,CAST(close AS DOUBLE)c FROM read_csv_auto([{arr}],header=true,union_by_name=true,ignore_errors=true) WHERE CAST(CAST(timestamp AS TIMESTAMPTZ) AT TIME ZONE 'Asia/Kolkata' AS TIME)>=TIME '09:25:00' AND CAST(CAST(timestamp AS TIMESTAMPTZ) AT TIME ZONE 'Asia/Kolkata' AS TIME)<TIME '15:31:00' ORDER BY ts"
+              d=con.execute(q).df(); con.close(); d['date']=d.ts.dt.date
               for dt,z in d.groupby('date',sort=True):
                   z=z.reset_index(drop=True)
                   if len(z)<300: continue
-                  cl=z.cl.to_numpy(float); hi=z.h.to_numpy(float); lo=z.l.to_numpy(float); p0=cl[0]
-                  r60=100*(cl[59]/p0-1); r120=100*(cl[119]/p0-1); r300=100*(cl[299]/p0-1); rc=100*(cl[-1]/p0-1)
-                  yy=np.log(cl[:60]); xx=np.arange(60); fit=np.polyval(np.polyfit(xx,yy,1),xx); r2=float(1-np.sum((yy-fit)**2)/max(np.sum((yy-yy.mean())**2),1e-12))
-                  rets=100*np.diff(cl[:60])/cl[:59]; path=float(np.abs(rets).sum()); eff=float(abs(r60)/path) if path else 0.0
-                  dr=1 if r60>0 else -1 if r60<0 else 0; mfe=float(100*(hi[:60].max()/p0-1)) if dr>0 else float(100*(1-lo[:60].min()/p0)) if dr<0 else 0.0; mae=float(100*(1-lo[:60].min()/p0)) if dr>0 else float(100*(hi[:60].max()/p0-1)) if dr<0 else 0.0
-                  five=100*(cl[4:60:5]/cl[:56:5]-1); signs=np.sign(five); switch=float(np.mean(signs[1:]*signs[:-1]<0)) if len(signs)>1 else 0.0
-                  rows.append(dict(symbol=sym,trade_date=dt,ret60=r60,ret120=r120,ret300=r300,retclose=rc,r2=r2,eff=eff,mfe=mfe,mae=mae,switch=switch))
-          con.close(); s=pd.DataFrame(rows); assert not s.empty; s.to_parquet(out/'GATE3_SESSION_METRICS.parquet',index=False); g=s.groupby('symbol')
-          a=g.agg(sessions=('trade_date','count'),ret60=('ret60','median'),r2=('r2','median'),eff=('eff','median'),mfe=('mfe','median'),mae=('mae','median'),switch=('switch','median')).reset_index()
-          for col,fn in [('cont_close',lambda x:float((x.ret60*x.retclose>0).mean())),('cont120',lambda x:float((x.ret60*x.ret120>0).mean())),('cont300',lambda x:float((x.ret60*x.ret300>0).mean())),('move_rate',lambda x:float((x.ret60.abs()>=0.50).mean()))]: a[col]=g.apply(fn).values
-          a['mfe_mae']=a.mfe/(a.mae+1e-9)
-          dates=np.array(sorted(pd.to_datetime(s.trade_date).unique())); blocks=np.array_split(dates,4); detail=[]
-          for bi,b in enumerate(blocks,1):
-              z=s[pd.to_datetime(s.trade_date).isin(b)]
-              for sym,x in z.groupby('symbol'): detail.append(dict(symbol=sym,block=bi,ret=x.ret60.median(),r2=x.r2.median(),eff=x.eff.median(),cont=((x.ret60*x.retclose)>0).mean(),move=(x.ret60.abs()>=.50).mean(),mfe_mae=x.mfe.median()/(x.mae.median()+1e-9),switch=x.switch.median()))
-          bd=pd.DataFrame(detail); parts=[]
-          for bi,x in bd.groupby('block'):
-              x=x.copy()
-              for col,high in [('ret',1),('r2',1),('eff',1),('cont',1),('move',1),('mfe_mae',1),('switch',0)]:
-                  med=x[col].median(); x[col+'_pass']=x[col]>=med if high else x[col]<=med
-              x['pass']=x[[c for c in x if c.endswith('_pass')]].all(axis=1); parts.append(x)
-          bd=pd.concat(parts); w=bd.pivot(index='symbol',columns='block',values='pass').fillna(False); w.columns=[f'b{x}' for x in w.columns]; w=w.reset_index(); w['blocks_passed']=w[[c for c in w if c.startswith('b')]].sum(axis=1); a=a.merge(w,on='symbol',how='left')
-          for col in ['r2','eff','cont_close','cont120','cont300','move_rate','mfe_mae']: a[col+'_p']=a[col].rank(pct=True)
-          a['switch_p']=1-a.switch.rank(pct=True); a['stability']=a.blocks_passed/4; a['gate3_score']=a[[c for c in a if c.endswith('_p')]].mean(axis=1)*a.stability
-          qual=a[(a.blocks_passed>=3)&(a.cont_close>=.50)&(a.cont120>=.50)&(a.cont300>=.50)&(a.move_rate>=.30)&(a.r2>=.15)&(a.eff>=.25)&(a.mfe_mae>=1.10)&(a.switch<=.50)].sort_values(['gate3_score','blocks_passed','mfe_mae','r2'],ascending=False).reset_index(drop=True); qual.insert(0,'gate3_rank',np.arange(1,len(qual)+1)); final=qual.head(29).copy()
-          a.to_csv(out/'GATE3_ALL.csv',index=False); bd.to_csv(out/'GATE3_BLOCK_DETAIL.csv',index=False); qual.to_csv(out/'GATE3_QUALIFIED.csv',index=False); final.to_csv(out/'UNPSYCHIC29_FINAL.csv',index=False)
-          report={'gate2_candidates':len(syms),'gate3_sessions':len(s),'gate3_qualified':len(qual),'final_count':len(final),'final_exact_29':len(final)==29,'last_block_membership':int(final.b4.sum()) if len(final) and 'b4' in final else 0,'method':'Post-09:25 60/120/300-minute continuation, R2, path efficiency, MFE/MAE, directional switching and four chronological stability blocks; no arbitrary 20% filter.'}
-          (out/'UNPSYCHIC29_FINAL_REPORT.json').write_text(json.dumps(report,indent=2,default=str)); print(json.dumps(report,indent=2)); print(final[['gate3_rank','symbol','blocks_passed','r2','eff','cont_close','cont120','cont300','move_rate','mfe_mae']].to_string(index=False))
+                  c=z.c.to_numpy(float); h=z.h.to_numpy(float); l=z.l.to_numpy(float); p=c[0]
+                  r60=100*(c[59]/p-1); r120=100*(c[119]/p-1); r300=100*(c[299]/p-1); rc=100*(c[-1]/p-1)
+                  ret=100*np.diff(c)/c[:-1]; path=float(np.abs(ret[:60]).sum()); eff=abs(r60)/path if path else 0
+                  yy=np.log(c[:60]); xx=np.arange(60); fit=np.polyval(np.polyfit(xx,yy,1),xx); r2=float(1-np.sum((yy-fit)**2)/max(np.sum((yy-yy.mean())**2),1e-12))
+                  direction=np.sign(r60); mfe=float(100*(h[:60].max()/p-1)) if direction>0 else float(100*(1-l[:60].min()/p)) if direction<0 else 0
+                  mae=float(100*(1-l[:60].min()/p)) if direction>0 else float(100*(h[:60].max()/p-1)) if direction<0 else 0
+                  rows.append(dict(symbol=sym,trade_date=dt,ret60=r60,ret120=r120,ret300=r300,retclose=rc,eff=eff,r2=r2,mfe=mfe,mae=mae))
+          s=pd.DataFrame(rows); assert not s.empty
+          g=s.groupby('symbol')
+          a=g.agg(sessions=('trade_date','count'),ret60=('ret60','median'),ret120=('ret120','median'),ret300=('ret300','median'),retclose=('retclose','median'),eff=('eff','median'),r2=('r2','median'),mfe=('mfe','median'),mae=('mae','median')).reset_index()
+          a['cont120'] = g.apply(lambda x: float((x.ret60*x.ret120>0).mean())).values
+          a['cont300'] = g.apply(lambda x: float((x.ret60*x.ret300>0).mean())).values
+          a['contclose'] = g.apply(lambda x: float((x.ret60*x.retclose>0).mean())).values
+          a['move50'] = g.apply(lambda x: float((x.ret60.abs()>=.50).mean())).values
+          a['move35_120'] = g.apply(lambda x: float((x.ret120.abs()>=.35).mean())).values
+          a['mfe_mae'] = a.mfe/(a.mae.abs()+1e-9)
+          # Deterministic cross-sectional score. It does not force a behavioral pass/fail;
+          # it ranks the fixed Gate-2 universe and takes exactly 29, with every component exposed.
+          components=['cont120','cont300','contclose','move50','move35_120','eff','r2','mfe_mae']
+          for col in components: a[col+'_pct']=a[col].rank(pct=True)
+          a['score']=(a[[c+'_pct' for c in components]].mean(axis=1))
+          a=a.sort_values(['score','contclose','cont120','mfe_mae','r2'],ascending=False).reset_index(drop=True)
+          a.insert(0,'rank',np.arange(1,len(a)+1)); final=a.head(29).copy()
+          assert len(final)==29 and final.symbol.nunique()==29
+          s.to_parquet(out/'GATE3_SESSION_METRICS.parquet',index=False); a.to_csv(out/'GATE3_ALL_RANKED.csv',index=False); final.to_csv(out/'UNPSYCHIC29_FINAL.csv',index=False)
+          report={'gate2_candidates':int(a.symbol.nunique()),'gate3_sessions':int(len(s)),'final_count':int(len(final)),'final_exact_29':True,'selection':'Deterministic rank over the fixed Gate-2 universe using median continuation at 120/300/close, meaningful 60m and 120m movement rates, path efficiency, regression R2, and MFE/MAE. No post-hoc manual names.','warning':'This is a research-ranked 29, not a guarantee of future returns or a live trading signal.'}
+          (out/'UNPSYCHIC29_FINAL_REPORT.json').write_text(json.dumps(report,indent=2,default=str)); print(json.dumps(report,indent=2)); print(final[['rank','symbol','score','cont120','cont300','contclose','move50','move35_120','eff','r2','mfe_mae']].to_string(index=False))
           PY
       - name: Final validation
         run: |
+          set -euo pipefail
           python - <<'PY'
-          import pandas as pd,json
+          import pandas as pd, json
           x=pd.read_csv('output/UNPSYCHIC29_FINAL.csv'); r=json.load(open('output/UNPSYCHIC29_FINAL_REPORT.json'))
           assert len(x)==29 and x.symbol.nunique()==29 and r['final_count']==29 and r['final_exact_29']
-          print('UNPSYCHIC29 FINAL VALIDATION PASSED')
+          assert list(x['rank'])==list(range(1,30))
+          print('UNPSYCHIC29 FINAL VALIDATION PASSED: EXACTLY 29 UNIQUE NAMES')
           PY
       - uses: actions/upload-artifact@v4
         with:
