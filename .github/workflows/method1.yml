@@ -1,0 +1,37 @@
+name: UNPSYCHIC29 Method 1 Quantile
+on: push
+jobs:
+  research:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          mkdir -p data output
+          B=https://github.com/zahidshaikmohammed-cmyk/dhan_research/releases/download/chatgpt-full-data-33258430945
+          curl -fL "$B/chatgpt-data-001.zip" -o /tmp/a.zip; curl -fL "$B/chatgpt-data-002.zip" -o /tmp/b.zip
+          unzip -q /tmp/a.zip -d data; unzip -q /tmp/b.zip -d data
+      - run: python -m pip install -q pandas numpy duckdb pyarrow
+      - run: python research/unpsychic29_deep_research_fast.py
+      - name: Quantile trigger discovery
+        run: |
+          python - <<'PY'
+          import pandas as pd,numpy as np,json
+          from pathlib import Path
+          o=Path('output'); e=pd.read_parquet(o/'ENTRY_EVENT_DATA.parquet'); e.trade_date=pd.to_datetime(e.trade_date); days=np.array(sorted(e.trade_date.dt.normalize().unique())); test=set(days[int(len(days)*.8):]); rows=[]
+          fs=['mom_3','mom_5','mom_10','mom_20','eff_5','eff_10','r2_10','r2_20','slope_10','relvol_5_20','dist_vwap_pct']
+          for (s,en),g in e.groupby(['symbol','entry']):
+            for f in fs:
+              a=g[f].abs().dropna()
+              for q in [.6,.7,.8,.9]:
+                if len(a)<40: continue
+                t=a.quantile(q)
+                for side in ['LONG','SHORT']:
+                  z=g[(~g.trade_date.dt.normalize().isin(test))&(g[f].abs()>=t)]; y=(z.fwd_60 if side=='LONG' else -z.fwd_60).dropna()
+                  if len(y)>=25: rows.append(dict(symbol=s,entry=en,feature=f,q=q,side=side,n=len(y),win=(y>0).mean(),median=y.median(),mean=y.mean()))
+          r=pd.DataFrame(rows)
+          if r.empty: raise SystemExit('NO_CANDIDATES')
+          r['score']=r.median*r.win; r=r.sort_values('score',ascending=False); r.to_csv(o/'METHOD1_QUANTILE.csv',index=False); r.head(29).to_csv(o/'METHOD1_BEST.csv',index=False); (o/'METHOD1_STATUS.json').write_text(json.dumps({'status':'PASS','candidates':len(r),'best_rows':min(29,len(r))},indent=2))
+          PY
+      - uses: actions/upload-artifact@v4
+        with: {name: UNPSYCHIC29-METHOD-1, path: output/}
