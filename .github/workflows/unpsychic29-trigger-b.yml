@@ -1,0 +1,28 @@
+name: UNPSYCHIC29 Trigger Research B - Two Factor
+on:
+  push:
+    branches: [main]
+    paths: [research/unpsychic29_entry_trigger_research_b.py, research/unpsychic29_deep_research_fast.py, .github/workflows/unpsychic29-trigger-b.yml]
+  workflow_dispatch:
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+    - uses: actions/checkout@v4
+    - name: Fetch release
+      run: |
+        set -e
+        B=https://github.com/zahidshaikmohammed-cmyk/dhan_research/releases/download/chatgpt-full-data-33258430945
+        mkdir -p data output
+        curl -fL --retry 5 -o /tmp/a.zip "$B/chatgpt-data-001.zip"
+        curl -fL --retry 5 -o /tmp/b.zip "$B/chatgpt-data-002.zip"
+        unzip -q /tmp/a.zip -d data; unzip -q /tmp/b.zip -d data
+    - run: python -m pip install -q pandas numpy duckdb pyarrow
+    - run: python research/unpsychic29_deep_research_fast.py
+    - run: python research/unpsychic29_entry_trigger_research_b.py
+    - uses: actions/upload-artifact@v4
+      with:
+        name: UNPSYCHIC29-TRIGGER-B
+        path: output/TRIGGER_B_*
+        retention-days: 90
