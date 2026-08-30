@@ -1,0 +1,66 @@
+name: UNPSYCHIC29 Entry Only V5 - Final Research
+on:
+  push:
+    branches: [main]
+    paths:
+      - research/unpsychic29_entry_only_v5.py
+      - .github/workflows/unpsychic29-entry-only-v5.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  entry-only:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download complete research release
+        shell: bash
+        run: |
+          set -euo pipefail
+          B=https://github.com/zahidshaikmohammed-cmyk/dhan_research/releases/download/chatgpt-full-data-33258430945
+          mkdir -p data output
+          curl -fL --retry 5 --retry-delay 3 -o /tmp/a.zip "$B/chatgpt-data-001.zip"
+          curl -fL --retry 5 --retry-delay 3 -o /tmp/b.zip "$B/chatgpt-data-002.zip"
+          unzip -q /tmp/a.zip -d data
+          unzip -q /tmp/b.zip -d data
+          rm -f /tmp/a.zip /tmp/b.zip
+      - name: Install exact runtime dependencies
+        run: python -m pip install --disable-pip-version-check -q pandas numpy duckdb pyarrow
+      - name: Preflight source and schema checks
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import zipfile
+          locked=['360ONE','MPHASIS','HCLTECH','POLYMED','JSL','AFFLE','SONACOMS','VEDL','NATIONALUM','JKCEMENT','ZENSARTECH','KEI','TATATECH','LTM','PVRINOX','UNOMINDA','ENDURANCE','RAINBOW','SHREECEM','APTUS','MOTILALOFS','ESCORTS','NATCOPHARM','SPLPETRO','PERSISTENT','TRAVELFOOD','UBL','INDIACEM','BHARTIHEXA']
+          for s in locked:
+              p=list(Path('data').rglob(f'raw_1min__{s}.parquet.chunk*.csv')) or list(Path('data').rglob(f'raw_1min__{s}.parquet'))
+              assert p, f'MISSING_RAW:{s}'
+          print('PREFLIGHT PASSED: all 29 locked symbols have raw files')
+          PY
+      - name: Run independent entry-only research
+        run: python research/unpsychic29_entry_only_v5.py
+      - name: Validate final entry table
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import pandas as pd,json
+          o=Path('output'); p=o/'UNPSYCHIC29_ENTRY_TRIGGERS_FINAL_V5.csv'; df=pd.read_csv(p)
+          required=['symbol','entry','side','feature','q','threshold','test_n','test_win','test_mean','test_median','executable_entry','invalidation','invalidation_field','status']
+          assert p.exists() and p.stat().st_size>0
+          assert all(c in df.columns for c in required)
+          assert df.symbol.nunique()==len(df)
+          locked={'360ONE','MPHASIS','HCLTECH','POLYMED','JSL','AFFLE','SONACOMS','VEDL','NATIONALUM','JKCEMENT','ZENSARTECH','KEI','TATATECH','LTM','PVRINOX','UNOMINDA','ENDURANCE','RAINBOW','SHREECEM','APTUS','MOTILALOFS','ESCORTS','NATCOPHARM','SPLPETRO','PERSISTENT','TRAVELFOOD','UBL','INDIACEM','BHARTIHEXA'}
+          assert set(df.symbol).issubset(locked)
+          assert set(df.side).issubset({'LONG','SHORT'})
+          assert set(df.status).issubset({'OOS_POSITIVE','OOS_WEAK_OR_NEGATIVE'})
+          for f in ['ENTRY_ONLY_EVENTS_V5.parquet','ENTRY_ONLY_COVERAGE_V5.csv','ENTRY_ONLY_ROBUST_CANDIDATES_V5.csv','ENTRY_ONLY_PROTOCOL_V5.json']:
+              assert (o/f).exists() and (o/f).stat().st_size>0
+          print(json.dumps({'rows':len(df),'stocks':int(df.symbol.nunique()),'oos_positive':int((df.status=='OOS_POSITIVE').sum()),'oos_weak_or_negative':int((df.status=='OOS_WEAK_OR_NEGATIVE').sum())},indent=2))
+          print(df.to_string(index=False))
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: UNPSYCHIC29-ENTRY-ONLY-V5-FINAL
+          path: output/
+          retention-days: 90
