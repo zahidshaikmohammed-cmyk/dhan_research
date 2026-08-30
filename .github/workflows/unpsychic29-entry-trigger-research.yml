@@ -1,9 +1,10 @@
-name: UNPSYCHIC29 Exact Entry Trigger Research V2
+name: UNPSYCHIC29 Exact Entry Trigger Research V3
 on:
   push:
     branches: [main]
     paths:
-      - research/unpsychic29_entry_trigger_research_v2.py
+      - research/unpsychic29_entry_trigger_research_v3.py
+      - research/unpsychic29_deep_research_fast.py
       - .github/workflows/unpsychic29-entry-trigger-research.yml
   workflow_dispatch:
 permissions:
@@ -22,14 +23,27 @@ jobs:
           mkdir -p data output
           curl -fL --retry 5 --retry-delay 3 -o /tmp/a.zip "$B/chatgpt-data-001.zip"
           curl -fL --retry 5 --retry-delay 3 -o /tmp/b.zip "$B/chatgpt-data-002.zip"
-          unzip -q /tmp/a.zip -d data
-          unzip -q /tmp/b.zip -d data
+          python - <<'PY'
+          from pathlib import Path
+          import zipfile
+          wanted={'360ONE','MPHASIS','HCLTECH','POLYMED','JSL','AFFLE','SONACOMS','VEDL','NATIONALUM','JKCEMENT','ZENSARTECH','KEI','TATATECH','LTM','PVRINOX','UNOMINDA','ENDURANCE','RAINBOW','SHREECEM','APTUS','MOTILALOFS','ESCORTS','NATCOPHARM','SPLPETRO','PERSISTENT','TRAVELFOOD','UBL','INDIACEM','BHARTIHEXA'}
+          out=Path('data')
+          for zp in ['/tmp/a.zip','/tmp/b.zip']:
+              with zipfile.ZipFile(zp) as z:
+                  hits=0
+                  for n in z.namelist():
+                      bn=Path(n).name
+                      if any(bn.startswith(f'raw_1min__{s}.parquet.chunk') and bn.endswith('.csv') for s in wanted):
+                          z.extract(n,out); hits+=1
+              print(f'{zp}: extracted {hits} locked-universe raw chunks')
+          PY
+          rm -f /tmp/a.zip /tmp/b.zip
       - name: Install research stack
         run: python -m pip install --disable-pip-version-check -q pandas numpy duckdb pyarrow
       - name: Build causal entry-event dataset
         run: python research/unpsychic29_deep_research_fast.py
-      - name: Research exact entry triggers V2
-        run: python research/unpsychic29_entry_trigger_research_v2.py
+      - name: Research exact entry triggers V3
+        run: python research/unpsychic29_entry_trigger_research_v3.py
       - name: Validate trigger research
         run: |
           python - <<'PY'
@@ -38,15 +52,18 @@ jobs:
           out=Path('output')
           locked={'360ONE','MPHASIS','HCLTECH','POLYMED','JSL','AFFLE','SONACOMS','VEDL','NATIONALUM','JKCEMENT','ZENSARTECH','KEI','TATATECH','LTM','PVRINOX','UNOMINDA','ENDURANCE','RAINBOW','SHREECEM','APTUS','MOTILALOFS','ESCORTS','NATCOPHARM','SPLPETRO','PERSISTENT','TRAVELFOOD','UBL','INDIACEM','BHARTIHEXA'}
           b=pd.read_csv(out/'ENTRY_TRIGGERS_BEST_BY_STOCK.csv')
-          assert set(b.symbol)<=locked and len(b)>0
-          assert set(['symbol','entry','side','gate_a','gate_b','test_n','test_mean','test_median']).issubset(b.columns)
-          for f in ['ENTRY_TRIGGER_CANDIDATES_ALL.csv','ENTRY_TRIGGERS_BEST_BY_STOCK.csv','ENTRY_TRIGGERS_OOS_SURVIVORS.csv','ENTRY_TRIGGER_PROTOCOL.json','ENTRY_TRIGGER_RESEARCH_SUMMARY.json']:
+          assert set(b.symbol)<=locked and b.symbol.nunique()<=29 and len(b)>0
+          assert set(['symbol','entry','side','family','gate_a','gate_b','validation_n','validation_mean','validation_median','test_n','test_mean','test_median','oos_status']).issubset(b.columns)
+          assert b.symbol.nunique()==len(b), 'At most one validation-selected trigger per stock is allowed'
+          for f in ['ENTRY_TRIGGER_CANDIDATES_ALL.csv','ENTRY_TRIGGER_ROBUST_CANDIDATES.csv','ENTRY_TRIGGERS_BEST_VALIDATED_29.csv','ENTRY_TRIGGERS_BEST_BY_STOCK.csv','ENTRY_TRIGGERS_OOS_SURVIVORS.csv','ENTRY_TRIGGER_PROTOCOL.json','ENTRY_TRIGGER_RESEARCH_SUMMARY.json']:
             assert (out/f).exists() and (out/f).stat().st_size>0, f
-          print('UNPSYCHIC29 EXACT ENTRY TRIGGER V2 VALIDATION PASSED')
-          print(json.loads((out/'ENTRY_TRIGGER_RESEARCH_SUMMARY.json').read_text()))
+          r=json.loads((out/'ENTRY_TRIGGER_RESEARCH_SUMMARY.json').read_text())
+          assert r['status']=='COMPLETE' and r['folds']==3
+          print('UNPSYCHIC29 EXACT ENTRY TRIGGER V3 VALIDATION PASSED')
+          print(json.dumps(r,indent=2))
           PY
       - uses: actions/upload-artifact@v4
         with:
-          name: UNPSYCHIC29-ENTRY-TRIGGER-RESEARCH-V2
+          name: UNPSYCHIC29-ENTRY-TRIGGER-RESEARCH-V3
           path: output/
           retention-days: 90
