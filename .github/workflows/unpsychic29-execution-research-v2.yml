@@ -1,0 +1,56 @@
+name: UNPSYCHIC29 Execution Research V2 - Causal Entry To Exit
+on:
+  push:
+    branches: [main]
+    paths:
+      - research/unpsychic29_execution_research_v2.py
+      - .github/workflows/unpsychic29-execution-research-v2.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  execution-research-v2:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download only Trigger-C stocks
+        run: |
+          set -euo pipefail
+          B=https://github.com/zahidshaikmohammed-cmyk/dhan_research/releases/download/chatgpt-full-data-33258430945
+          mkdir -p data output
+          curl -fL --retry 5 --retry-delay 3 -o /tmp/a.zip "$B/chatgpt-data-001.zip"
+          curl -fL --retry 5 --retry-delay 3 -o /tmp/b.zip "$B/chatgpt-data-002.zip"
+          python - <<'PY'
+          import zipfile
+          from pathlib import Path
+          wanted={'MPHASIS','HCLTECH','POLYMED','JSL','AFFLE','SONACOMS','VEDL','KEI','TATATECH','LTM','UNOMINDA','SHREECEM','APTUS','MOTILALOFS','NATCOPHARM','PERSISTENT'}
+          for zp in ['/tmp/a.zip','/tmp/b.zip']:
+            with zipfile.ZipFile(zp) as z:
+              for n in z.namelist():
+                bn=Path(n).name
+                if any(bn.startswith('raw_1min__'+s+'.parquet.chunk') and bn.endswith('.csv') for s in wanted): z.extract(n,'data')
+          PY
+          rm -f /tmp/a.zip /tmp/b.zip
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check -q pandas numpy
+      - name: Execute causal entry-to-exit research
+        run: python research/unpsychic29_execution_research_v2.py
+      - name: Integrity validation
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import pandas as pd,json
+          o=Path('output'); c=pd.read_csv(o/'EXECUTION_TRIGGER_C_REBUILT_V2.csv'); t=pd.read_csv(o/'EXECUTION_TRADES_V2.csv'); s=pd.read_csv(o/'EXECUTION_SELECTED_RULES_V2.csv')
+          assert len(c)>0 and len(t)>0 and len(s)>0
+          assert set(c.symbol).issubset({'MPHASIS','HCLTECH','POLYMED','JSL','AFFLE','SONACOMS','VEDL','KEI','TATATECH','LTM','UNOMINDA','SHREECEM','APTUS','MOTILALOFS','NATCOPHARM','PERSISTENT'})
+          assert all(x in s.columns for x in ['symbol','entry','side','orb_stop','target_R','validation_mean','test_mean','test_win','break_even_roundtrip_bps'])
+          print('EXECUTION V2 VALIDATION PASSED')
+          print(json.dumps(json.loads((o/'EXECUTION_RESEARCH_PROTOCOL_V2.json').read_text()),indent=2))
+          print(s.to_string(index=False))
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: UNPSYCHIC29-EXECUTION-RESEARCH-V2
+          path: output/
+          retention-days: 90
