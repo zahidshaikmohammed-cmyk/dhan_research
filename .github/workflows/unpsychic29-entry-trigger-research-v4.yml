@@ -1,0 +1,51 @@
+name: UNPSYCHIC29 Exact Entry Trigger Research V4
+on:
+  push:
+    branches: [main]
+    paths:
+      - research/unpsychic29_entry_trigger_research_v4.py
+      - research/unpsychic29_deep_research_fast.py
+      - .github/workflows/unpsychic29-entry-trigger-research-v4.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  trigger-research-v4:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download release data
+        run: |
+          set -euo pipefail
+          B=https://github.com/zahidshaikmohammed-cmyk/dhan_research/releases/download/chatgpt-full-data-33258430945
+          mkdir -p data output
+          curl -fL --retry 5 --retry-delay 3 -o /tmp/a.zip "$B/chatgpt-data-001.zip"
+          curl -fL --retry 5 --retry-delay 3 -o /tmp/b.zip "$B/chatgpt-data-002.zip"
+          unzip -q /tmp/a.zip -d data
+          unzip -q /tmp/b.zip -d data
+          rm /tmp/a.zip /tmp/b.zip
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check -q pandas numpy duckdb pyarrow
+      - name: Build event dataset
+        run: python research/unpsychic29_deep_research_fast.py
+      - name: Run independent V4 trigger discovery
+        run: python research/unpsychic29_entry_trigger_research_v4.py
+      - name: Validate outputs
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import pandas as pd,json
+          o=Path('output'); b=pd.read_csv(o/'V4_BEST_TRIGGER_PER_STOCK.csv'); s=pd.read_csv(o/'V4_OOS_SURVIVORS.csv')
+          assert len(b)>0 and b.symbol.nunique()==len(b)<=29
+          assert set(b.symbol).issubset({'360ONE','MPHASIS','HCLTECH','POLYMED','JSL','AFFLE','SONACOMS','VEDL','NATIONALUM','JKCEMENT','ZENSARTECH','KEI','TATATECH','LTM','PVRINOX','UNOMINDA','ENDURANCE','RAINBOW','SHREECEM','APTUS','MOTILALOFS','ESCORTS','NATCOPHARM','SPLPETRO','PERSISTENT','TRAVELFOOD','UBL','INDIACEM','BHARTIHEXA'})
+          assert all(x in b.columns for x in ['symbol','entry','side','feature','threshold','val_n','val_win','val_mean','val_median','test_n','test_win','test_mean','test_median'])
+          for f in ['V4_TRIGGER_CANDIDATES.csv','V4_TRIGGER_OOS.csv','V4_BEST_TRIGGER_PER_STOCK.csv','V4_OOS_SURVIVORS.csv','V4_PROTOCOL.json']:
+            assert (o/f).exists() and (o/f).stat().st_size>0
+          print(json.dumps({'best_rows':len(b),'oos_survivors':len(s),'long':int((b.side=='LONG').sum()),'short':int((b.side=='SHORT').sum())},indent=2))
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: UNPSYCHIC29-ENTRY-TRIGGER-RESEARCH-V4
+          path: output/
+          retention-days: 90
