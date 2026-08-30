@@ -1,0 +1,62 @@
+name: UNPSYCHIC29 Execution Research V1
+on:
+  push:
+    branches: [main]
+    paths:
+      - research/unpsychic29_execution_research_v1.py
+      - .github/workflows/unpsychic29-execution-research-v1.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  execution-research:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download only Trigger-C candidate universe
+        run: |
+          set -euo pipefail
+          B=https://github.com/zahidshaikmohammed-cmyk/dhan_research/releases/download/chatgpt-full-data-33258430945
+          mkdir -p data output
+          curl -fL --retry 5 --retry-delay 3 -o /tmp/a.zip "$B/chatgpt-data-001.zip"
+          curl -fL --retry 5 --retry-delay 3 -o /tmp/b.zip "$B/chatgpt-data-002.zip"
+          python - <<'PY'
+          import zipfile
+          from pathlib import Path
+          wanted={'MPHASIS','HCLTECH','POLYMED','JSL','AFFLE','SONACOMS','VEDL','KEI','TATATECH','LTM','UNOMINDA','SHREECEM','APTUS','MOTILALOFS','NATCOPHARM','PERSISTENT'}
+          out=Path('data')
+          for zp in ['/tmp/a.zip','/tmp/b.zip']:
+            with zipfile.ZipFile(zp) as z:
+              n=0
+              for name in z.namelist():
+                bn=Path(name).name
+                if any(bn.startswith('raw_1min__'+s+'.parquet.chunk') and bn.endswith('.csv') for s in wanted):
+                  z.extract(name,out); n+=1
+              print(zp,'candidate chunks:',n)
+          PY
+          rm -f /tmp/a.zip /tmp/b.zip
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check -q pandas numpy pyarrow
+      - name: Run execution research
+        run: python research/unpsychic29_execution_research_v1.py
+      - name: Validate research outputs
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import pandas as pd,json
+          o=Path('output'); s=pd.read_csv(o/'EXECUTION_SELECTED_RULES.csv')
+          assert (o/'EXECUTION_RESEARCH_PROTOCOL.json').exists()
+          assert (o/'EXECUTION_TRIGGER_C_REBUILT.csv').exists()
+          assert (o/'EXECUTION_VARIANT_RESULTS.csv').exists()
+          assert len(s)>0
+          assert all(s['mean_gross']>0)
+          print('EXECUTION RESEARCH VALIDATION PASSED')
+          print(json.dumps(json.loads((o/'EXECUTION_RESEARCH_PROTOCOL.json').read_text()),indent=2))
+          print(s.to_string(index=False))
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: UNPSYCHIC29-EXECUTION-RESEARCH-V1
+          path: output/
+          retention-days: 90
