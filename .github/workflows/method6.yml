@@ -1,0 +1,31 @@
+name: UNPSYCHIC29 Method 6 Stability
+on: push
+jobs:
+  research:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          mkdir -p data output; B=https://github.com/zahidshaikmohammed-cmyk/dhan_research/releases/download/chatgpt-full-data-33258430945; curl -fL "$B/chatgpt-data-001.zip" -o /tmp/a.zip; curl -fL "$B/chatgpt-data-002.zip" -o /tmp/b.zip; unzip -q /tmp/a.zip -d data; unzip -q /tmp/b.zip -d data
+      - run: python -m pip install -q pandas numpy duckdb pyarrow
+      - run: python research/unpsychic29_deep_research_fast.py
+      - run: |
+          python - <<'PY'
+          import pandas as pd,numpy as np,json
+          from pathlib import Path
+          o=Path('output'); e=pd.read_parquet(o/'ENTRY_EVENT_DATA.parquet'); e.trade_date=pd.to_datetime(e.trade_date); days=np.array(sorted(e.trade_date.dt.normalize().unique())); folds=np.array_split(days,4); rows=[]
+          for (s,en),g in e.groupby(['symbol','entry']):
+            for f in ['mom_3','mom_10','eff_10','r2_20','relvol_5_20','dist_vwap_pct']:
+              for side in ['LONG','SHORT']:
+                vals=[]
+                for fold in folds:
+                  z=g[g.trade_date.dt.normalize().isin(fold)]; y=(z.loc[z[f]>0,'fwd_60'] if side=='LONG' else -z.loc[z[f]<0,'fwd_60']).dropna()
+                  if len(y)>=10: vals.append(float(y.median()))
+                if len(vals)>=3: rows.append({'symbol':s,'entry':en,'feature':f,'side':side,'folds':len(vals),'median_fold_return':np.median(vals),'min_fold_return':min(vals),'positive_folds':sum(x>0 for x in vals)})
+          r=pd.DataFrame(rows)
+          if r.empty: raise SystemExit('NO_STABILITY_RULES')
+          r['score']=r.median_fold_return*r.positive_folds; r.sort_values('score',ascending=False).to_csv(o/'METHOD6_STABILITY.csv',index=False); (o/'METHOD6_STATUS.json').write_text(json.dumps({'status':'PASS','candidates':len(r)},indent=2))
+          PY
+      - uses: actions/upload-artifact@v4
+        with: {name: UNPSYCHIC29-METHOD-6, path: output/}
